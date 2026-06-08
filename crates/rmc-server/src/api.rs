@@ -19,5 +19,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 200);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(body_str, "OK");
     }
 }
