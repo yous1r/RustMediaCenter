@@ -20,8 +20,8 @@ pub fn app_router(state: AppState) -> Router {
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
-pub async fn login() -> &'static str {
-    "Mock JWT Token"
+pub async fn login() -> String {
+    crate::auth::create_jwt("admin").unwrap_or_else(|_| "Error".to_string())
 }
 
 pub async fn get_libraries() -> &'static str {
