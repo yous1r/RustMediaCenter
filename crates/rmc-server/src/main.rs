@@ -3,7 +3,11 @@ mod db;
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
-    let app = api::app_router();
+    let db = db::Database::new_in_memory().unwrap();
+    db.init_schema().unwrap();
+    
+    let state = std::sync::Arc::new(std::sync::Mutex::new(db));
+    let app = api::app_router(state);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await?;
     axum::serve(listener, app).await?;
     Ok(())
