@@ -12,7 +12,12 @@ pub fn app_router(state: AppState) -> Router {
         .route("/users", get(get_users))
         .route("/stream/:id/direct", get(direct_stream))
         .route("/api/v1/playback/progress", axum::routing::post(report_progress))
+        .route("/api/v1/auth/login", axum::routing::post(login))
         .with_state(state)
+}
+
+pub async fn login() -> &'static str {
+    "Mock JWT Token"
 }
 
 async fn list_movies(State(state): State<AppState>) -> Result<Json<Vec<Movie>>, axum::http::StatusCode> {
@@ -115,6 +120,25 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_auth_login() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use crate::db::Database;
+        use std::sync::Arc;
+
+        let db = Database::new_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        
+        let response = app
+            .oneshot(Request::builder().method("POST").uri("/api/v1/auth/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(response.status(), 200);
     }
 }

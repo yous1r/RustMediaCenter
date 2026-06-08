@@ -1,5 +1,6 @@
 mod app;
 mod api_client;
+mod player;
 
 use app::RmcApp;
 

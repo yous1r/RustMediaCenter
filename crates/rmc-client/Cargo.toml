@@ -9,3 +9,4 @@ rmc-core = { path = "../rmc-core" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1.0", features = ["full", "macros"] }
 serde_json = "1.0"
+rmc-player-engine = { path = "../rmc-player-engine" }
