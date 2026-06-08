@@ -14,6 +14,14 @@ pub struct User {
     pub username: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TVShow {
+    pub id: i64,
+    pub title: String,
+    pub season_count: Option<u16>,
+    pub file_path: std::path::PathBuf,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,5 +45,17 @@ mod tests {
     fn test_user_model() {
         let user = User { id: 1, username: "admin".to_string() };
         assert_eq!(user.username, "admin");
+    }
+
+    #[test]
+    fn test_tvshow_serialization() {
+        let show = super::TVShow {
+            id: 1,
+            title: "Test Show".to_string(),
+            season_count: Some(3),
+            file_path: std::path::PathBuf::from("/path/to/show"),
+        };
+        let json = serde_json::to_string(&show).unwrap();
+        assert!(json.contains("Test Show"));
     }
 }

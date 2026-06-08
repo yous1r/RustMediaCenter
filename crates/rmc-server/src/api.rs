@@ -13,11 +13,26 @@ pub fn app_router(state: AppState) -> Router {
         .route("/stream/:id/direct", get(direct_stream))
         .route("/api/v1/playback/progress", axum::routing::post(report_progress))
         .route("/api/v1/auth/login", axum::routing::post(login))
+        .route("/api/v1/libraries", get(get_libraries))
+        .route("/api/v1/movies/:id", get(get_movie_by_id))
+        .route("/api/v1/playback/start", axum::routing::post(playback_start))
         .with_state(state)
 }
 
 pub async fn login() -> &'static str {
     "Mock JWT Token"
+}
+
+pub async fn get_libraries() -> &'static str {
+    "[{\"id\":1,\"name\":\"Movies\"}]"
+}
+
+pub async fn get_movie_by_id(Path(id): Path<i64>) -> String {
+    format!("{{\"id\":{},\"title\":\"Mock Movie\",\"stream_url\":\"/stream/{}/direct\"}}", id, id)
+}
+
+pub async fn playback_start() -> &'static str {
+    "Playback Started"
 }
 
 async fn list_movies(State(state): State<AppState>) -> Result<Json<Vec<Movie>>, axum::http::StatusCode> {
@@ -139,6 +154,60 @@ mod tests {
             .oneshot(Request::builder().method("POST").uri("/api/v1/auth/login").body(Body::empty()).unwrap())
             .await
             .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_get_libraries() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use crate::db::Database;
+        use std::sync::Arc;
+        
+        let db = Database::new_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        
+        let response = app.clone()
+            .oneshot(Request::builder().uri("/api/v1/libraries").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_get_movie_by_id() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use crate::db::Database;
+        use std::sync::Arc;
+        
+        let db = Database::new_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        
+        let response = app.clone()
+            .oneshot(Request::builder().uri("/api/v1/movies/1").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_playback_start() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use crate::db::Database;
+        use std::sync::Arc;
+        
+        let db = Database::new_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        
+        let response = app.clone()
+            .oneshot(Request::builder().method("POST").uri("/api/v1/playback/start").body(Body::empty()).unwrap())
+            .await.unwrap();
         assert_eq!(response.status(), 200);
     }
 }
