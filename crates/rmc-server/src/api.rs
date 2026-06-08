@@ -1,4 +1,4 @@
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{extract::{Path, State}, routing::get, Json, Router};
 use std::sync::{Arc, Mutex};
 use crate::db::Database;
 use rmc_core::models::Movie;
@@ -9,6 +9,7 @@ pub fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/api/v1/movies", get(list_movies))
+        .route("/stream/:id/direct", get(direct_stream))
         .with_state(state)
 }
 
@@ -28,6 +29,10 @@ async fn list_movies(State(state): State<AppState>) -> Result<Json<Vec<Movie>>, 
     })?;
     
     Ok(Json(movies))
+}
+
+pub async fn direct_stream(Path(id): Path<i64>) -> String {
+    format!("Streaming movie id: {}", id)
 }
 
 #[cfg(test)]
@@ -79,5 +84,16 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("Matrix"));
+    }
+
+    #[tokio::test]
+    async fn test_direct_play_api() {
+        let app = app_router(std::sync::Arc::new(std::sync::Mutex::new(crate::db::Database::new_in_memory().unwrap())));
+        let response = app
+            .oneshot(Request::builder().uri("/stream/1/direct").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
     }
 }
