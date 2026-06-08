@@ -1,11 +1,17 @@
 use axum::{extract::{Path, State}, routing::get, Json, Router};
 use std::sync::{Arc, Mutex};
+use tower_http::cors::{Any, CorsLayer};
 use crate::db::Database;
 use rmc_core::models::{Movie, User};
 
 pub type AppState = Arc<Mutex<Database>>;
 
 pub fn app_router(state: AppState) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/api/v1/movies", get(list_movies))
@@ -18,6 +24,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/playback/start", axum::routing::post(playback_start))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(cors)
 }
 
 pub async fn login() -> String {
@@ -229,5 +236,31 @@ mod tests {
         ).await.unwrap();
         
         assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_cors_headers() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use crate::db::Database;
+        use std::sync::Arc;
+        
+        let db = Database::new_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        
+        let response = app.oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/v1/movies")
+                .header("Origin", "http://localhost:5173")
+                .header("Access-Control-Request-Method", "GET")
+                .body(Body::empty())
+                .unwrap()
+        ).await.unwrap();
+        
+        assert_eq!(response.status(), 200);
+        assert!(response.headers().contains_key("access-control-allow-origin"));
     }
 }
