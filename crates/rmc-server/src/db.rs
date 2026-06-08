@@ -63,6 +63,10 @@ impl Database {
         }
         Ok(movies)
     }
+
+    pub fn search_movies(&self, _query: &str) -> Vec<rmc_core::models::Movie> {
+        vec![]
+    }
 }
 
 #[cfg(test)]
@@ -86,5 +90,13 @@ mod tests {
         let movies = db.get_all_movies().unwrap();
         assert_eq!(movies.len(), 1);
         assert_eq!(movies[0].title, "Inception");
+    }
+
+    #[test]
+    fn test_search_movies() {
+        let db = Database::new_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let results = db.search_movies("Matrix");
+        assert_eq!(results.len(), 0);
     }
 }

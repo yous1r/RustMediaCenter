@@ -1,5 +1,6 @@
 mod api;
 mod db;
+pub mod strm;
 pub mod watcher;
 pub mod transcode;
 pub mod scraper;
