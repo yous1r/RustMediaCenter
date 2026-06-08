@@ -18,8 +18,14 @@ async fn list_movies(State(state): State<AppState>) -> Result<Json<Vec<Movie>>, 
         db.get_all_movies()
     })
     .await
-    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| {
+        eprintln!("Task join error: {:?}", e);
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .map_err(|e| {
+        eprintln!("Database error: {:?}", e);
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     
     Ok(Json(movies))
 }
