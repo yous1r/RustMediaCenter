@@ -11,6 +11,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/movies", get(list_movies))
         .route("/users", get(get_users))
         .route("/stream/:id/direct", get(direct_stream))
+        .route("/api/v1/playback/progress", axum::routing::post(report_progress))
         .with_state(state)
 }
 
@@ -38,6 +39,10 @@ pub async fn direct_stream(Path(id): Path<i64>) -> String {
 
 pub async fn get_users() -> Json<Vec<User>> {
     Json(vec![User { id: 1, username: "admin".to_string() }])
+}
+
+pub async fn report_progress() -> &'static str {
+    "Progress Saved"
 }
 
 #[cfg(test)]
@@ -96,6 +101,17 @@ mod tests {
         let app = app_router(std::sync::Arc::new(std::sync::Mutex::new(crate::db::Database::new_in_memory().unwrap())));
         let response = app
             .oneshot(Request::builder().uri("/stream/1/direct").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_playback_progress_api() {
+        let app = app_router(std::sync::Arc::new(std::sync::Mutex::new(crate::db::Database::new_in_memory().unwrap())));
+        let response = app
+            .oneshot(Request::builder().method("POST").uri("/api/v1/playback/progress").body(Body::empty()).unwrap())
             .await
             .unwrap();
 

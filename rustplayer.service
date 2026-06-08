@@ -1,0 +1,13 @@
+# rustplayer.service
+[Unit]
+Description=RustMediaCenter Server
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/rmc-server
+Restart=always
+User=media
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
