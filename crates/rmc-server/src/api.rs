@@ -1,7 +1,7 @@
 use axum::{extract::{Path, State}, routing::get, Json, Router};
 use std::sync::{Arc, Mutex};
 use crate::db::Database;
-use rmc_core::models::Movie;
+use rmc_core::models::{Movie, User};
 
 pub type AppState = Arc<Mutex<Database>>;
 
@@ -9,6 +9,7 @@ pub fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/api/v1/movies", get(list_movies))
+        .route("/users", get(get_users))
         .route("/stream/:id/direct", get(direct_stream))
         .with_state(state)
 }
@@ -33,6 +34,10 @@ async fn list_movies(State(state): State<AppState>) -> Result<Json<Vec<Movie>>, 
 
 pub async fn direct_stream(Path(id): Path<i64>) -> String {
     format!("Streaming movie id: {}", id)
+}
+
+pub async fn get_users() -> Json<Vec<User>> {
+    Json(vec![User { id: 1, username: "admin".to_string() }])
 }
 
 #[cfg(test)]
