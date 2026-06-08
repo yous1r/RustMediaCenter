@@ -17,6 +17,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/movies/:id", get(get_movie_by_id))
         .route("/api/v1/playback/start", axum::routing::post(playback_start))
         .with_state(state)
+        .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
 pub async fn login() -> &'static str {
@@ -42,11 +43,11 @@ async fn list_movies(State(state): State<AppState>) -> Result<Json<Vec<Movie>>, 
     })
     .await
     .map_err(|e| {
-        eprintln!("Task join error: {:?}", e);
+        tracing::error!("Task join error: {:?}", e);
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?
     .map_err(|e| {
-        eprintln!("Database error: {:?}", e);
+        tracing::error!("Database error: {:?}", e);
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
     
@@ -208,6 +209,25 @@ mod tests {
         let response = app.clone()
             .oneshot(Request::builder().method("POST").uri("/api/v1/playback/start").body(Body::empty()).unwrap())
             .await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_tracing() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use crate::db::Database;
+        use std::sync::Arc;
+        
+        let db = Database::new_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        
+        let response = app.oneshot(
+            Request::builder().uri("/health").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        
         assert_eq!(response.status(), 200);
     }
 }
