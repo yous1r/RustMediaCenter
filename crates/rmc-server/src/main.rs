@@ -1,5 +1,6 @@
 mod api;
 mod db;
+pub mod watcher;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
