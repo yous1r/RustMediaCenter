@@ -7,6 +7,12 @@ pub struct Database {
 }
 
 impl Database {
+    pub fn new<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        Ok(Self {
+            conn: Connection::open(path)?,
+        })
+    }
+
     pub fn new_in_memory() -> Result<Self> {
         Ok(Self {
             conn: Connection::open_in_memory()?,

@@ -3,7 +3,7 @@ mod db;
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
-    let db = db::Database::new_in_memory().unwrap();
+    let db = db::Database::new("movies.db").unwrap();
     db.init_schema().unwrap();
     
     let state = std::sync::Arc::new(std::sync::Mutex::new(db));

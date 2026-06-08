@@ -12,10 +12,16 @@ pub fn app_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn list_movies(State(state): State<AppState>) -> Json<Vec<Movie>> {
-    let db = state.lock().unwrap();
-    let movies = db.get_all_movies().unwrap_or_default();
-    Json(movies)
+async fn list_movies(State(state): State<AppState>) -> Result<Json<Vec<Movie>>, axum::http::StatusCode> {
+    let movies = tokio::task::spawn_blocking(move || {
+        let db = state.lock().unwrap();
+        db.get_all_movies()
+    })
+    .await
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(Json(movies))
 }
 
 #[cfg(test)]
