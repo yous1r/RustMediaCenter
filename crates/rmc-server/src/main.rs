@@ -5,6 +5,7 @@ pub mod watcher;
 pub mod transcode;
 pub mod scraper;
 pub mod config;
+pub mod error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
