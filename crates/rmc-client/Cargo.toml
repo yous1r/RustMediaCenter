@@ -1,0 +1,11 @@
+[package]
+name = "rmc-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = "0.14"
+rmc-core = { path = "../rmc-core" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1.0", features = ["full", "macros"] }
+serde_json = "1.0"

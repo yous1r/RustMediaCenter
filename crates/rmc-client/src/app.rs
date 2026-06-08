@@ -1,0 +1,117 @@
+use iced::{Task, Element};
+use iced::widget::{text, column, scrollable, container};
+use rmc_core::models::Movie;
+use reqwest::Error;
+use std::sync::Arc;
+
+pub struct RmcApp {
+    pub movies: Vec<Movie>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    LoadMovies,
+    MoviesLoaded(Result<Vec<Movie>, Arc<Error>>),
+}
+
+impl Default for RmcApp {
+    fn default() -> Self {
+        Self {
+            movies: Vec::new(),
+            error_message: None,
+        }
+    }
+}
+
+impl RmcApp {
+    pub fn new() -> (Self, Task<Message>) {
+        (
+            Self::default(),
+            Task::perform(
+                async {
+                    crate::api_client::fetch_movies("http://127.0.0.1:8000/api/v1/movies")
+                        .await
+                        .map_err(Arc::new)
+                },
+                Message::MoviesLoaded,
+            ),
+        )
+    }
+
+
+
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::LoadMovies => {
+                self.error_message = None;
+                Task::perform(
+                    async {
+                        crate::api_client::fetch_movies("http://127.0.0.1:8000/api/v1/movies")
+                            .await
+                            .map_err(Arc::new)
+                    },
+                    Message::MoviesLoaded,
+                )
+            }
+            Message::MoviesLoaded(Ok(movies)) => {
+                self.movies = movies;
+                self.error_message = None;
+                Task::none()
+            }
+            Message::MoviesLoaded(Err(e)) => {
+                self.error_message = Some(e.to_string());
+                Task::none()
+            }
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        if let Some(ref err) = self.error_message {
+            return container(text(format!("Error loading movies: {}", err)))
+                .center(iced::Length::Fill)
+                .into();
+        }
+
+        if self.movies.is_empty() {
+            return container(text("Loading movies or library is empty..."))
+                .center(iced::Length::Fill)
+                .into();
+        }
+
+        let mut col = column![].spacing(10);
+        for movie in &self.movies {
+            let title = movie.title.clone();
+            let year_str = movie.year.map(|y| y.to_string()).unwrap_or_else(|| "Unknown".to_string());
+            col = col.push(text(format!("{} ({})", title, year_str)));
+        }
+
+        scrollable(container(col).padding(20)).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_initial_state() {
+        let (app, _) = RmcApp::new();
+        assert_eq!(app.movies.len(), 0);
+    }
+    
+    #[test]
+    fn test_update_movies_message() {
+        let (mut app, _) = RmcApp::new();
+        let test_movies = vec![Movie {
+            id: 1,
+            title: "Test Movie".to_string(),
+            year: Some(2025),
+            file_path: std::path::PathBuf::from("/m/test.mp4"),
+        }];
+        
+        let _ = app.update(Message::MoviesLoaded(Ok(test_movies)));
+        assert_eq!(app.movies.len(), 1);
+        assert_eq!(app.movies[0].title, "Test Movie");
+    }
+}
