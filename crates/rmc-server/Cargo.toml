@@ -10,3 +10,5 @@ tower = { version = "0.4", features = ["util"] }
 rmc-core = { path = "../rmc-core" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 notify = "6.1"
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }

@@ -1,6 +1,7 @@
 mod app;
 mod api_client;
 mod player;
+pub mod views;
 
 use app::RmcApp;
 
