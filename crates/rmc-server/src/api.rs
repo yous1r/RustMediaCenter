@@ -1,10 +1,10 @@
 use axum::{extract::{Path, State}, routing::get, Json, Router};
-use std::sync::{Arc, Mutex};
+
 use tower_http::cors::{Any, CorsLayer};
 use crate::db::Database;
 use rmc_core::models::{Movie, User};
 
-pub type AppState = Arc<Mutex<Database>>;
+pub type AppState = Database;
 
 pub fn app_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
@@ -44,16 +44,7 @@ pub async fn playback_start() -> &'static str {
 }
 
 async fn list_movies(State(state): State<AppState>) -> Result<Json<Vec<Movie>>, axum::http::StatusCode> {
-    let movies = tokio::task::spawn_blocking(move || {
-        let db = state.lock().unwrap();
-        db.get_all_movies()
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!("Task join error: {:?}", e);
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .map_err(|e| {
+    let movies = state.get_movies().await.map_err(|e| {
         tracing::error!("Database error: {:?}", e);
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -81,8 +72,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check() {
-        let db = crate::db::Database::new_in_memory().unwrap();
-        let app = app_router(std::sync::Arc::new(std::sync::Mutex::new(db)));
+        let db = crate::db::Database::new("sqlite::memory:").await.unwrap();
+        let app = app_router(db);
         let response = app
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
@@ -99,18 +90,17 @@ mod tests {
     async fn test_get_movies_api() {
         use rmc_core::models::Movie;
         use crate::db::Database;
-        use std::sync::Arc;
         
-        let db = Database::new_in_memory().unwrap();
-        db.init_schema().unwrap();
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
         db.insert_movie(&Movie {
             id: 1,
             title: "Matrix".to_string(),
             year: Some(1999),
             file_path: std::path::PathBuf::from("/m/matrix.mp4"),
-        }).unwrap();
+        }).await.unwrap();
 
-        let app = app_router(Arc::new(std::sync::Mutex::new(db)));
+        let app = app_router(db);
         
         let response = app
             .oneshot(axum::http::Request::builder().uri("/api/v1/movies").body(axum::body::Body::empty()).unwrap())
@@ -126,7 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_play_api() {
-        let app = app_router(std::sync::Arc::new(std::sync::Mutex::new(crate::db::Database::new_in_memory().unwrap())));
+        let app = app_router(crate::db::Database::new("sqlite::memory:").await.unwrap());
         let response = app
             .oneshot(Request::builder().uri("/stream/1/direct").body(Body::empty()).unwrap())
             .await
@@ -137,7 +127,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_playback_progress_api() {
-        let app = app_router(std::sync::Arc::new(std::sync::Mutex::new(crate::db::Database::new_in_memory().unwrap())));
+        let app = app_router(crate::db::Database::new("sqlite::memory:").await.unwrap());
         let response = app
             .oneshot(Request::builder().method("POST").uri("/api/v1/playback/progress").body(Body::empty()).unwrap())
             .await
@@ -152,11 +142,10 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
         use crate::db::Database;
-        use std::sync::Arc;
 
-        let db = Database::new_in_memory().unwrap();
-        db.init_schema().unwrap();
-        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        let app = super::app_router(db);
         
         let response = app
             .oneshot(Request::builder().method("POST").uri("/api/v1/auth/login").body(Body::empty()).unwrap())
@@ -171,11 +160,10 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
         use crate::db::Database;
-        use std::sync::Arc;
         
-        let db = Database::new_in_memory().unwrap();
-        db.init_schema().unwrap();
-        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        let app = super::app_router(db);
         
         let response = app.clone()
             .oneshot(Request::builder().uri("/api/v1/libraries").body(Body::empty()).unwrap())
@@ -189,11 +177,10 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
         use crate::db::Database;
-        use std::sync::Arc;
         
-        let db = Database::new_in_memory().unwrap();
-        db.init_schema().unwrap();
-        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        let app = super::app_router(db);
         
         let response = app.clone()
             .oneshot(Request::builder().uri("/api/v1/movies/1").body(Body::empty()).unwrap())
@@ -207,11 +194,10 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
         use crate::db::Database;
-        use std::sync::Arc;
         
-        let db = Database::new_in_memory().unwrap();
-        db.init_schema().unwrap();
-        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        let app = super::app_router(db);
         
         let response = app.clone()
             .oneshot(Request::builder().method("POST").uri("/api/v1/playback/start").body(Body::empty()).unwrap())
@@ -225,11 +211,10 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
         use crate::db::Database;
-        use std::sync::Arc;
         
-        let db = Database::new_in_memory().unwrap();
-        db.init_schema().unwrap();
-        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        let app = super::app_router(db);
         
         let response = app.oneshot(
             Request::builder().uri("/health").body(Body::empty()).unwrap()
@@ -244,11 +229,10 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
         use crate::db::Database;
-        use std::sync::Arc;
         
-        let db = Database::new_in_memory().unwrap();
-        db.init_schema().unwrap();
-        let app = super::app_router(Arc::new(std::sync::Mutex::new(db)));
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        let app = super::app_router(db);
         
         let response = app.oneshot(
             Request::builder()

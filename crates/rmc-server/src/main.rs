@@ -15,11 +15,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     tracing::info!("Starting RustMediaCenter server...");
 
-    let db = db::Database::new("movies.db")?;
-    db.init_schema()?;
+    let db = db::Database::new("sqlite::memory:").await?;
+    db.init_schema().await?;
     
-    let state = std::sync::Arc::new(std::sync::Mutex::new(db));
-    let app = api::app_router(state);
+    let app = api::app_router(db);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await?;
     axum::serve(listener, app).await?;
     Ok(())
