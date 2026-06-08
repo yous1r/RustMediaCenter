@@ -8,3 +8,4 @@ axum = "0.7"
 tokio = { version = "1.0", features = ["full"] }
 tower = { version = "0.4", features = ["util"] }
 rmc-core = { path = "../rmc-core" }
+rusqlite = { version = "0.31", features = ["bundled"] }
