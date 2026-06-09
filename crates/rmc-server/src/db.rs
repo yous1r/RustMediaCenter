@@ -25,11 +25,18 @@ fn map_row_to_movie(r: &sqlx::sqlite::SqliteRow) -> Movie {
 
 impl Database {
     pub async fn new(db_url: &str) -> Result<Self, sqlx::Error> {
+        use std::str::FromStr;
+        use sqlx::sqlite::SqliteConnectOptions;
+
+        let options = SqliteConnectOptions::from_str(db_url)?
+            .create_if_missing(true);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(DEFAULT_MAX_CONNECTIONS)
-            .connect(db_url).await?;
+            .connect_with(options).await?;
         Ok(Self { pool })
     }
+
 
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
         sqlx::query(
@@ -300,4 +307,29 @@ mod tests {
         let count_after_delete = db.get_movie_count().await.unwrap();
         assert_eq!(count_after_delete, 0);
     }
+
+    #[tokio::test]
+    async fn test_sqlite_file_connection() {
+        use std::str::FromStr;
+        use sqlx::sqlite::SqliteConnectOptions;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("rmc.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        // 方案 1：直接通过 SqliteConnectOptions 显式配置 create_if_missing(true)
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path_str)).unwrap()
+            .create_if_missing(true);
+        let pool_res1 = SqlitePoolOptions::new().connect_with(options).await;
+
+        // 方案 2：先在磁盘上创建出空白文件，再用原连接方式
+        let db_path_manual = temp_dir.path().join("rmc_manual.db");
+        std::fs::File::create(&db_path_manual).unwrap();
+        let pool_res2 = SqlitePoolOptions::new().connect(&format!("sqlite:{}", db_path_manual.to_string_lossy())).await;
+
+        assert!(pool_res1.is_ok(), "SqliteConnectOptions with create_if_missing(true) failed: {:?}", pool_res1.err());
+        assert!(pool_res2.is_ok(), "Manual file creation connect failed: {:?}", pool_res2.err());
+    }
 }
+
+

@@ -139,7 +139,7 @@ mod tests {
         let temp_db_dir = tempfile::tempdir().unwrap();
         let db_path = temp_db_dir.path().join("test_rmc.db");
         std::fs::File::create(&db_path).unwrap();
-        let db_url = format!("sqlite://{}", db_path.to_string_lossy());
+        let db_url = format!("sqlite:{}", db_path.to_string_lossy());
         let db = crate::db::Database::new(&db_url).await.unwrap();
         db.init_schema().await.unwrap();
 

@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let db = db::Database::new(&format!("sqlite://{}", config.db_path)).await?;
+    let db = db::Database::new(&format!("sqlite:{}", config.db_path)).await?;
     db.init_schema().await?;
 
     let mut media_watcher = watcher::MediaWatcher::new(db.clone());
