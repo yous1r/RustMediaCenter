@@ -1,4 +1,4 @@
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{sqlite::SqlitePoolOptions, SqlitePool, Row};
 use rmc_core::models::Movie;
 
 #[derive(Clone)]
@@ -21,7 +21,9 @@ impl Database {
                 title TEXT NOT NULL,
                 year INTEGER NOT NULL,
                 file_path TEXT NOT NULL
-            );"
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS movies_fts USING fts5(title, content='movies', content_rowid='id');
+            "
         )
         .execute(&self.pool)
         .await?;
@@ -30,10 +32,16 @@ impl Database {
 
     pub async fn insert_movie(&self, movie: &Movie) -> Result<(), sqlx::Error> {
         let file_path_str = movie.file_path.to_string_lossy().to_string();
-        sqlx::query("INSERT INTO movies (title, year, file_path) VALUES (?, ?, ?)")
+        let result = sqlx::query("INSERT INTO movies (title, year, file_path) VALUES (?, ?, ?)")
             .bind(&movie.title)
             .bind(movie.year)
             .bind(&file_path_str)
+            .execute(&self.pool)
+            .await?;
+        let id = result.last_insert_rowid();
+        sqlx::query("INSERT INTO movies_fts (rowid, title) VALUES (?, ?)")
+            .bind(id)
+            .bind(&movie.title)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -51,8 +59,18 @@ impl Database {
         Ok(movies)
     }
 
-    pub async fn search_movies(&self, _query: &str) -> Result<Vec<Movie>, sqlx::Error> {
-        Ok(vec![])
+    pub async fn search_movies(&self, query: &str) -> Result<Vec<Movie>, sqlx::Error> {
+        let q = format!("{}*", query); // SQLite FTS wildcard
+        let rows = sqlx::query("SELECT m.id, m.title, m.year, m.file_path FROM movies m JOIN movies_fts f ON m.id = f.rowid WHERE movies_fts MATCH ?")
+            .bind(q)
+            .fetch_all(&self.pool).await?;
+        let movies = rows.into_iter().map(|r| Movie {
+            id: r.get::<i64, _>("id"),
+            title: r.get::<String, _>("title"),
+            year: Some(r.get::<i64, _>("year") as u16),
+            file_path: std::path::PathBuf::from(r.get::<String, _>("file_path")),
+        }).collect();
+        Ok(movies)
     }
 }
 
@@ -92,5 +110,22 @@ mod tests {
         let db = Database::new("sqlite::memory:").await.unwrap();
         db.init_schema().await.unwrap();
         assert!(true); // 如果不抛错说明连接池及 schema 成功初始化
+    }
+
+    #[tokio::test]
+    async fn test_fts5_search() {
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        let m = rmc_core::models::Movie {
+            id: 0,
+            title: "The Matrix".to_string(),
+            year: Some(1999),
+            file_path: std::path::PathBuf::from("/m.mkv")
+        };
+        db.insert_movie(&m).await.unwrap();
+        
+        let res = db.search_movies("Matrix").await.unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].title, "The Matrix");
     }
 }
