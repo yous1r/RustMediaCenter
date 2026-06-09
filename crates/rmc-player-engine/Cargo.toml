@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ffmpeg-next = { version = "7.0", optional = true }
+ffmpeg-next = "7.0.2"
 wgpu = { version = "0.19", optional = true } # 注意这里使用 0.19 比较稳妥
 cpal = { version = "0.15", optional = true }
