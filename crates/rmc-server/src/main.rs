@@ -27,7 +27,10 @@ async fn main() -> anyhow::Result<()> {
     let db = db::Database::new(&format!("sqlite://{}", config.db_path)).await?;
     db.init_schema().await?;
 
-    watcher::start_watcher();
+    let mut media_watcher = watcher::MediaWatcher::new(db.clone());
+    if let Err(e) = media_watcher.start(&config.media_dirs) {
+        tracing::error!("Failed to start watcher: {:?}", e);
+    }
     
     let app = api::app_router(db);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
