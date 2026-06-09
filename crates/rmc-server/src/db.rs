@@ -1,15 +1,32 @@
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool, Row};
 use rmc_core::models::Movie;
 
+const DEFAULT_MAX_CONNECTIONS: u32 = 5;
+
 #[derive(Clone)]
 pub struct Database {
     pub pool: SqlitePool,
 }
 
+fn map_row_to_movie(r: &sqlx::sqlite::SqliteRow) -> Movie {
+    Movie {
+        id: r.get::<i64, _>("id"),
+        title: r.get::<String, _>("title"),
+        year: r.get::<Option<i32>, _>("year").and_then(|y| y.try_into().ok()),
+        file_path: std::path::PathBuf::from(r.get::<String, _>("file_path")),
+        poster_url: r.get::<Option<String>, _>("poster_url"),
+        overview: r.get::<Option<String>, _>("overview"),
+        tmdb_id: r.get::<Option<i64>, _>("tmdb_id"),
+        runtime_minutes: r.get::<Option<i32>, _>("runtime_minutes").and_then(|r| r.try_into().ok()),
+        added_at: r.get::<i64, _>("added_at"),
+        file_size: r.get::<Option<i64>, _>("file_size").and_then(|s| s.try_into().ok()),
+    }
+}
+
 impl Database {
     pub async fn new(db_url: &str) -> Result<Self, sqlx::Error> {
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(DEFAULT_MAX_CONNECTIONS)
             .connect(db_url).await?;
         Ok(Self { pool })
     }
@@ -82,18 +99,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
         
-        Ok(Movie {
-            id: r.get::<i64, _>("id"),
-            title: r.get::<String, _>("title"),
-            year: r.get::<Option<i32>, _>("year").map(|y| y as u16),
-            file_path: std::path::PathBuf::from(r.get::<String, _>("file_path")),
-            poster_url: r.get::<Option<String>, _>("poster_url"),
-            overview: r.get::<Option<String>, _>("overview"),
-            tmdb_id: r.get::<Option<i64>, _>("tmdb_id"),
-            runtime_minutes: r.get::<Option<i32>, _>("runtime_minutes").map(|r| r as u16),
-            added_at: r.get::<i64, _>("added_at"),
-            file_size: r.get::<Option<i64>, _>("file_size").map(|s| s as u64),
-        })
+        Ok(map_row_to_movie(&r))
     }
 
     pub async fn update_movie_metadata(
@@ -122,18 +128,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
         
-        let movies = rows.into_iter().map(|r| Movie {
-            id: r.get::<i64, _>("id"),
-            title: r.get::<String, _>("title"),
-            year: r.get::<Option<i32>, _>("year").map(|y| y as u16),
-            file_path: std::path::PathBuf::from(r.get::<String, _>("file_path")),
-            poster_url: r.get::<Option<String>, _>("poster_url"),
-            overview: r.get::<Option<String>, _>("overview"),
-            tmdb_id: r.get::<Option<i64>, _>("tmdb_id"),
-            runtime_minutes: r.get::<Option<i32>, _>("runtime_minutes").map(|r| r as u16),
-            added_at: r.get::<i64, _>("added_at"),
-            file_size: r.get::<Option<i64>, _>("file_size").map(|s| s as u64),
-        }).collect();
+        let movies = rows.iter().map(map_row_to_movie).collect();
         Ok(movies)
     }
 
@@ -157,18 +152,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
         
-        let movies = rows.into_iter().map(|r| Movie {
-            id: r.get::<i64, _>("id"),
-            title: r.get::<String, _>("title"),
-            year: r.get::<Option<i32>, _>("year").map(|y| y as u16),
-            file_path: std::path::PathBuf::from(r.get::<String, _>("file_path")),
-            poster_url: r.get::<Option<String>, _>("poster_url"),
-            overview: r.get::<Option<String>, _>("overview"),
-            tmdb_id: r.get::<Option<i64>, _>("tmdb_id"),
-            runtime_minutes: r.get::<Option<i32>, _>("runtime_minutes").map(|r| r as u16),
-            added_at: r.get::<i64, _>("added_at"),
-            file_size: r.get::<Option<i64>, _>("file_size").map(|s| s as u64),
-        }).collect();
+        let movies = rows.iter().map(map_row_to_movie).collect();
         Ok(movies)
     }
 
@@ -183,18 +167,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         
-        let movies = rows.into_iter().map(|r| Movie {
-            id: r.get::<i64, _>("id"),
-            title: r.get::<String, _>("title"),
-            year: r.get::<Option<i32>, _>("year").map(|y| y as u16),
-            file_path: std::path::PathBuf::from(r.get::<String, _>("file_path")),
-            poster_url: r.get::<Option<String>, _>("poster_url"),
-            overview: r.get::<Option<String>, _>("overview"),
-            tmdb_id: r.get::<Option<i64>, _>("tmdb_id"),
-            runtime_minutes: r.get::<Option<i32>, _>("runtime_minutes").map(|r| r as u16),
-            added_at: r.get::<i64, _>("added_at"),
-            file_size: r.get::<Option<i64>, _>("file_size").map(|s| s as u64),
-        }).collect();
+        let movies = rows.iter().map(map_row_to_movie).collect();
         Ok(movies)
     }
 }
@@ -240,7 +213,7 @@ mod tests {
     async fn test_sqlx_pool_init() {
         let db = Database::new("sqlite::memory:").await.unwrap();
         db.init_schema().await.unwrap();
-        assert!(true); // 如果不抛错说明连接池及 schema 成功初始化
+        // 如果不抛错说明连接池及 schema 成功初始化
     }
 
     #[tokio::test]
