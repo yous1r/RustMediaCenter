@@ -1,4 +1,3 @@
-import './style.css';
 
 // 常量定义，消除魔术数字
 const DEBOUNCE_DELAY_MS = 300;
