@@ -1,4 +1,5 @@
-use axum::{extract::{Path, State}, routing::get, Json, Router};
+use axum::{extract::{Path, State, Query}, routing::get, Json, Router};
+use serde::Deserialize;
 
 use tower_http::cors::{Any, CorsLayer};
 use crate::db::Database;
@@ -43,11 +44,20 @@ pub async fn playback_start() -> &'static str {
     "Playback Started"
 }
 
-async fn list_movies(State(state): State<AppState>) -> Result<Json<Vec<Movie>>, axum::http::StatusCode> {
-    let movies = state.get_movies().await.map_err(|e| {
-        tracing::error!("Database error: {:?}", e);
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+#[derive(Deserialize)]
+pub struct MovieQuery {
+    pub q: Option<String>,
+}
+
+async fn list_movies(
+    State(db): State<AppState>,
+    Query(query): Query<MovieQuery>,
+) -> Result<Json<Vec<Movie>>, crate::error::AppError> {
+    let movies = if let Some(q) = query.q {
+        db.search_movies(&q).await.map_err(|e| crate::error::AppError::Internal(e.into()))?
+    } else {
+        db.get_movies().await.map_err(|e| crate::error::AppError::Internal(e.into()))?
+    };
     
     Ok(Json(movies))
 }
@@ -246,5 +256,29 @@ mod tests {
         
         assert_eq!(response.status(), 200);
         assert!(response.headers().contains_key("access-control-allow-origin"));
+    }
+
+    #[tokio::test]
+    async fn test_api_search_movies() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use crate::db::Database;
+        
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        db.insert_movie(&rmc_core::models::Movie { id:0, title:"Inception".to_string(), year:Some(2010), file_path:std::path::PathBuf::from("/m.mkv") }).await.unwrap();
+        
+        let app = super::app_router(db); 
+        
+        // 测 GET /api/v1/movies?q=Inception
+        let response = app.oneshot(
+            Request::builder().uri("/api/v1/movies?q=Inception").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        
+        assert_eq!(response.status(), 200);
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(body_str.contains("Inception"));
     }
 }
