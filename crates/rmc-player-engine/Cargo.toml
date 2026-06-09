@@ -5,5 +5,8 @@ edition = "2021"
 
 [dependencies]
 ffmpeg-next = "7.0.2"
-wgpu = { version = "0.19", optional = true } # 注意这里使用 0.19 比较稳妥
+wgpu = "0.20"
 cpal = "0.15"
+
+[dev-dependencies]
+tokio = { version = "1.37", features = ["full", "test-util"] }
