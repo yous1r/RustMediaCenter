@@ -23,11 +23,11 @@ use std::fs;
 use std::path::Path;
 
 impl ServerConfig {
-    pub fn load_from(path: &str) -> Result<Self, anyhow::Error> {
-        let path = Path::new(path);
+    pub fn load_from<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
+        let path = path.as_ref();
         if !path.exists() {
             let default_config = Self::default();
-            default_config.save_to(path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid path"))?)?;
+            default_config.save_to(path)?;
             return Ok(default_config);
         }
         let content = fs::read_to_string(path)?;
@@ -35,8 +35,8 @@ impl ServerConfig {
         Ok(config)
     }
 
-    pub fn save_to(&self, path: &str) -> Result<(), anyhow::Error> {
-        let path = Path::new(path);
+    pub fn save_to<P: AsRef<Path>>(&self, path: P) -> Result<(), anyhow::Error> {
+        let path = path.as_ref();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -63,10 +63,9 @@ mod tests {
     fn test_config_load_and_save() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config_path = temp_dir.path().join("config.toml");
-        let path_str = config_path.to_str().unwrap();
 
         // 1. 首次加载，文件不存在，应该自动创建并保存默认配置
-        let mut config = ServerConfig::load_from(path_str).unwrap();
+        let mut config = ServerConfig::load_from(&config_path).unwrap();
         assert_eq!(config.port, 8000);
         assert_eq!(config.media_dirs, vec!["/media".to_string()]);
         assert_eq!(config.db_path, "rmc.db".to_string());
@@ -78,10 +77,10 @@ mod tests {
         config.media_dirs = vec!["/media1".to_string(), "/media2".to_string()];
         config.db_path = "rmc_test.db".to_string();
         config.tmdb_api_key = Some("test_api_key".to_string());
-        config.save_to(path_str).unwrap();
+        config.save_to(&config_path).unwrap();
 
         // 3. 再次加载，确保读取修改后的配置
-        let loaded = ServerConfig::load_from(path_str).unwrap();
+        let loaded = ServerConfig::load_from(&config_path).unwrap();
         assert_eq!(loaded.port, 9000);
         assert_eq!(loaded.media_dirs, vec!["/media1".to_string(), "/media2".to_string()]);
         assert_eq!(loaded.db_path, "rmc_test.db".to_string());

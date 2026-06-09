@@ -9,7 +9,7 @@ pub mod error;
 pub mod auth;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("rmc_server=debug".parse().unwrap()))
         .init();
