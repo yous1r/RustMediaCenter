@@ -5,7 +5,6 @@ use tokio::process::{Child, Command};
 
 const HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 const CLEANUP_INTERVAL_SECS: u64 = 10;
-const SPAWN_CHECK_DELAY_MS: u64 = 100;
 
 pub enum SessionState {
     Spawning,
@@ -194,11 +193,29 @@ impl TranscodeManager {
         let use_fallback = match &mut child {
             Err(_) => true,
             Ok(c) => {
-                tokio::time::sleep(tokio::time::Duration::from_millis(SPAWN_CHECK_DELAY_MS)).await;
-                match c.try_wait() {
-                    Ok(Some(status)) => !status.success(),
-                    _ => false,
+                let mut fallback = false;
+                // Poll for up to 1.5 seconds to see if the process exits early or succeeds in creating the file
+                for _ in 0..15 {
+                    match c.try_wait() {
+                        Ok(Some(status)) => {
+                            if !status.success() {
+                                fallback = true;
+                            }
+                            break;
+                        }
+                        Ok(None) => {
+                            if std::path::Path::new(&m3u8_path).exists() {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            fallback = true;
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
+                fallback
             }
         };
 
@@ -312,9 +329,9 @@ mod tests {
         let temp_dir_fixture = tempfile::tempdir().unwrap();
         let transcode_dir = temp_dir_fixture.path();
 
-        // 创建一个 mock 脚本，忽略所有参数并无限挂起，模拟正在转码的 ffmpeg 进程
+        // 创建一个 mock 脚本，忽略所有参数并在生成 m3u8 后无限挂起，模拟正在转码的 ffmpeg 进程
         let mock_script = transcode_dir.join("mock_ffmpeg.sh");
-        std::fs::write(&mock_script, "#!/bin/sh\nsleep 100\n").unwrap();
+        std::fs::write(&mock_script, "#!/bin/sh\nfor arg; do true; done\ntouch \"$arg\"\nsleep 100\n").unwrap();
         let mut perms = std::fs::metadata(&mock_script).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&mock_script, perms).unwrap();
