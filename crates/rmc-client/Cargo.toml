@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-iced = "0.14"
+iced = { version = "0.14", features = ["image", "tokio", "advanced"] }
 rmc-core = { path = "../rmc-core" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1.0", features = ["full", "macros"] }
