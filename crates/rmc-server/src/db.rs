@@ -17,9 +17,9 @@ fn map_row_to_movie(r: &sqlx::sqlite::SqliteRow) -> Movie {
         poster_url: r.get::<Option<String>, _>("poster_url"),
         overview: r.get::<Option<String>, _>("overview"),
         tmdb_id: r.get::<Option<i64>, _>("tmdb_id"),
-        runtime_minutes: r.get::<Option<i32>, _>("runtime_minutes").and_then(|r| r.try_into().ok()),
+        runtime_minutes: r.get::<Option<i32>, _>("runtime_minutes").and_then(|mins| mins.try_into().ok()),
         added_at: r.get::<i64, _>("added_at"),
-        file_size: r.get::<Option<i64>, _>("file_size").and_then(|s| s.try_into().ok()),
+        file_size: r.get::<Option<i64>, _>("file_size").and_then(|size| size.try_into().ok()),
     }
 }
 
@@ -66,7 +66,7 @@ impl Database {
     }
 
     pub async fn insert_movie(&self, movie: &Movie) -> Result<(), sqlx::Error> {
-        let file_path_str = movie.file_path.to_string_lossy().to_string();
+        let file_path_str = movie.file_path.to_string_lossy().into_owned();
         sqlx::query(
             "INSERT OR IGNORE INTO movies (title, year, file_path, poster_url, overview, tmdb_id, runtime_minutes, added_at, file_size)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -157,6 +157,9 @@ impl Database {
     }
 
     pub async fn search_movies(&self, query: &str) -> Result<Vec<Movie>, sqlx::Error> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
         let wildcard_query = format!("{}*", query);
         let rows = sqlx::query(
             "SELECT m.id, m.title, m.year, m.file_path, m.poster_url, m.overview, m.tmdb_id, m.runtime_minutes, m.added_at, m.file_size
