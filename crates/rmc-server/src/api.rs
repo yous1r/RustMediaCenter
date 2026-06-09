@@ -314,6 +314,27 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        key: &'static str,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap();
+            std::env::set_var(key, val);
+            Self { _lock: lock, key }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.key);
+        }
+    }
+
     #[tokio::test]
     async fn test_health_check() {
         let db = crate::db::Database::new("sqlite::memory:").await.unwrap();
@@ -617,6 +638,98 @@ mod tests {
         assert_eq!(response.status().as_u16(), 302);
         let location = response.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "http://example.com/stream.mkv");
+    }
+
+    #[tokio::test]
+    async fn test_config_api_endpoints() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::config::ServerConfig;
+
+        // Create a temp file path for configuration isolation
+        let temp_dir = tempfile::tempdir()?;
+        let config_path = temp_dir.path().join("test_config.toml");
+
+        // Thread-safe isolation for environment variable mutation
+        let _guard = EnvGuard::set("RMC_CONFIG", config_path.to_str().ok_or("Invalid path string")?);
+
+        // Ensure default config file is created/loaded
+        let default_config = ServerConfig::default();
+        default_config.save_to(&config_path)?;
+
+        let db = Database::new("sqlite::memory:").await?;
+        db.init_schema().await?;
+        let app = super::app_router(db);
+
+        // 1. Send GET request to /api/v1/config
+        let response = app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/config")
+                    .body(Body::empty())?
+            )
+            .await?;
+
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body_config: ServerConfig = serde_json::from_slice(&body)?;
+        
+        // Verify default tmdb_proxy_url and tmdb_api_base are None
+        assert!(body_config.tmdb_proxy_url.is_none());
+        assert!(body_config.tmdb_api_base.is_none());
+
+        // 2. Send POST request to /api/v1/config with updated values
+        let mut updated_config = default_config.clone();
+        updated_config.tmdb_proxy_url = Some("http://127.0.0.1:7890".to_string());
+        updated_config.tmdb_api_base = Some("https://api.tmdb.org".to_string());
+        
+        let post_body = serde_json::to_vec(&updated_config)?;
+        let response = app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(post_body))?
+            )
+            .await?;
+
+        assert_eq!(response.status(), 200);
+
+        // 3. Send GET request again to verify updated values
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/config")
+                    .body(Body::empty())?
+            )
+            .await?;
+
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body_config: ServerConfig = serde_json::from_slice(&body)?;
+
+        assert_eq!(
+            body_config.tmdb_proxy_url.as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            body_config.tmdb_api_base.as_deref(),
+            Some("https://api.tmdb.org")
+        );
+
+        // 4. Verify that the file on disk actually contains the updated configuration
+        let file_config = ServerConfig::load_from(&config_path)?;
+        assert_eq!(
+            file_config.tmdb_proxy_url.as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            file_config.tmdb_api_base.as_deref(),
+            Some("https://api.tmdb.org")
+        );
+
+        Ok(())
     }
 }
 
