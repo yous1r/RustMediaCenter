@@ -15,11 +15,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     tracing::info!("Starting RustMediaCenter server...");
 
-    let db = db::Database::new("sqlite::memory:").await?;
+    let config = config::ServerConfig::load_from("config.toml")?;
+
+    if let Some(parent) = std::path::Path::new(&config.db_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let db = db::Database::new(&format!("sqlite://{}", config.db_path)).await?;
     db.init_schema().await?;
+
+    watcher::start_watcher();
     
     let app = api::app_router(db);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await?;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }

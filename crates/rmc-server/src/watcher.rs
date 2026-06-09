@@ -43,6 +43,10 @@ impl MediaWatcher {
     }
 }
 
+pub fn start_watcher() {
+    // Stub function for file event monitoring
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

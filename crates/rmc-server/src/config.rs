@@ -1,27 +1,91 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
     pub port: u16,
-    pub media_dir: String,
+    pub media_dirs: Vec<String>,
+    pub db_path: String,
+    pub tmdb_api_key: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             port: 8000,
-            media_dir: "/media".to_string(),
+            media_dirs: vec!["/media".to_string()],
+            db_path: "rmc.db".to_string(),
+            tmdb_api_key: None,
         }
+    }
+}
+
+use std::fs;
+use std::path::Path;
+
+impl ServerConfig {
+    pub fn load_from(path: &str) -> Result<Self, anyhow::Error> {
+        let path = Path::new(path);
+        if !path.exists() {
+            let default_config = Self::default();
+            default_config.save_to(path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid path"))?)?;
+            return Ok(default_config);
+        }
+        let content = fs::read_to_string(path)?;
+        let config = toml::from_str(&content)?;
+        Ok(config)
+    }
+
+    pub fn save_to(&self, path: &str) -> Result<(), anyhow::Error> {
+        let path = Path::new(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string(self)?;
+        fs::write(path, content)?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_config_defaults() {
         let config = ServerConfig::default();
         assert_eq!(config.port, 8000);
-        assert_eq!(config.media_dir, "/media");
+        assert_eq!(config.media_dirs, vec!["/media".to_string()]);
+        assert_eq!(config.db_path, "rmc.db");
+        assert_eq!(config.tmdb_api_key, None);
+    }
+
+    #[test]
+    fn test_config_load_and_save() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        let path_str = config_path.to_str().unwrap();
+
+        // 1. 首次加载，文件不存在，应该自动创建并保存默认配置
+        let mut config = ServerConfig::load_from(path_str).unwrap();
+        assert_eq!(config.port, 8000);
+        assert_eq!(config.media_dirs, vec!["/media".to_string()]);
+        assert_eq!(config.db_path, "rmc.db".to_string());
+        assert_eq!(config.tmdb_api_key, None);
+        assert!(config_path.exists());
+
+        // 2. 修改配置并保存
+        config.port = 9000;
+        config.media_dirs = vec!["/media1".to_string(), "/media2".to_string()];
+        config.db_path = "rmc_test.db".to_string();
+        config.tmdb_api_key = Some("test_api_key".to_string());
+        config.save_to(path_str).unwrap();
+
+        // 3. 再次加载，确保读取修改后的配置
+        let loaded = ServerConfig::load_from(path_str).unwrap();
+        assert_eq!(loaded.port, 9000);
+        assert_eq!(loaded.media_dirs, vec!["/media1".to_string(), "/media2".to_string()]);
+        assert_eq!(loaded.db_path, "rmc_test.db".to_string());
+        assert_eq!(loaded.tmdb_api_key, Some("test_api_key".to_string()));
     }
 }
+
