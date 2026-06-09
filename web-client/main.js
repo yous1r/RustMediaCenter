@@ -308,6 +308,14 @@ async function renderSettingsPage(app) {
             <label for="tmdb_api_key">TMDB API Key (Optional)</label>
             <input type="text" id="tmdb_api_key" class="login-input" placeholder="Enter your TMDB API Key">
           </div>
+          <div class="form-group">
+            <label for="tmdb_proxy_url">TMDB Proxy URL (Optional)</label>
+            <input type="text" id="tmdb_proxy_url" class="login-input" placeholder="e.g. http://127.0.0.1:7890">
+          </div>
+          <div class="form-group">
+            <label for="tmdb_api_base">TMDB API Base URL (Optional)</label>
+            <input type="text" id="tmdb_api_base" class="login-input" placeholder="e.g. https://api.tmdb.org">
+          </div>
           
           <div class="form-actions">
             <button type="button" id="btn-scan" class="btn-secondary">立即扫描入库 & 刮削</button>
@@ -329,6 +337,8 @@ async function renderSettingsPage(app) {
     document.querySelector('#db_path').value = config.db_path || 'rmc.db';
     document.querySelector('#media_dirs').value = (config.media_dirs || []).join('\n');
     document.querySelector('#tmdb_api_key').value = config.tmdb_api_key || '';
+    document.querySelector('#tmdb_proxy_url').value = config.tmdb_proxy_url || '';
+    document.querySelector('#tmdb_api_base').value = config.tmdb_api_base || '';
   } catch (err) {
     console.error('Failed to load ServerConfig', err);
     showSettingsMessage('Failed to load server configuration.', '#ef4444');
@@ -374,12 +384,16 @@ async function saveConfig() {
   const port = parseInt(portVal, 10);
   const media_dirs = media_dirs_text.split('\n').map(s => s.trim()).filter(s => s.length > 0);
   const tmdb_api_key = tmdb_api_key_raw.trim() || null;
+  const tmdb_proxy_url = document.querySelector('#tmdb_proxy_url').value.trim() || null;
+  const tmdb_api_base = document.querySelector('#tmdb_api_base').value.trim() || null;
 
   const payload = {
     port,
     db_path,
     media_dirs,
-    tmdb_api_key
+    tmdb_api_key,
+    tmdb_proxy_url,
+    tmdb_api_base
   };
 
   try {
