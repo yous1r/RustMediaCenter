@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
@@ -18,9 +20,6 @@ impl Default for ServerConfig {
         }
     }
 }
-
-use std::fs;
-use std::path::Path;
 
 impl ServerConfig {
     pub fn load_from<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {

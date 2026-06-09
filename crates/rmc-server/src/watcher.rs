@@ -21,11 +21,17 @@ impl MediaWatcher {
             return Ok(());
         }
         
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
         
         watcher.watch(std::path::Path::new(&self.directory), RecursiveMode::Recursive)?;
         
+        std::thread::spawn(move || {
+            for event in rx {
+                tracing::debug!("Watcher event: {:?}", event);
+            }
+        });
+
         self.watcher = Some(watcher);
         self.running.store(true, Ordering::SeqCst);
         
