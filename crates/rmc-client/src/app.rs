@@ -1,8 +1,6 @@
 use iced::{Task, Element};
 use iced::widget::{text, column, scrollable, container};
 use rmc_core::models::Movie;
-use reqwest::Error;
-use std::sync::Arc;
 
 pub struct RmcApp {
     pub movies: Vec<Movie>,
@@ -12,7 +10,7 @@ pub struct RmcApp {
 #[derive(Debug, Clone)]
 pub enum Message {
     LoadMovies,
-    MoviesLoaded(Result<Vec<Movie>, Arc<Error>>),
+    MoviesLoaded(Result<Vec<Movie>, String>),
 }
 
 impl Default for RmcApp {
@@ -30,16 +28,13 @@ impl RmcApp {
             Self::default(),
             Task::perform(
                 async {
-                    crate::api_client::fetch_movies("http://127.0.0.1:8000/api/v1/movies")
-                        .await
-                        .map_err(Arc::new)
+                    let client = crate::api_client::ApiClient::new("http://127.0.0.1:8000".to_string());
+                    client.fetch_movies().await
                 },
                 Message::MoviesLoaded,
             ),
         )
     }
-
-
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
@@ -47,9 +42,8 @@ impl RmcApp {
                 self.error_message = None;
                 Task::perform(
                     async {
-                        crate::api_client::fetch_movies("http://127.0.0.1:8000/api/v1/movies")
-                            .await
-                            .map_err(Arc::new)
+                        let client = crate::api_client::ApiClient::new("http://127.0.0.1:8000".to_string());
+                        client.fetch_movies().await
                     },
                     Message::MoviesLoaded,
                 )
@@ -60,7 +54,7 @@ impl RmcApp {
                 Task::none()
             }
             Message::MoviesLoaded(Err(e)) => {
-                self.error_message = Some(e.to_string());
+                self.error_message = Some(e);
                 Task::none()
             }
         }
