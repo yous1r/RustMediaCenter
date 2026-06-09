@@ -55,6 +55,12 @@ impl Database {
             title: r.get::<String, _>("title"),
             year: Some(r.get::<i64, _>("year") as u16),
             file_path: std::path::PathBuf::from(r.get::<String, _>("file_path")),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            added_at: 0,
+            file_size: None,
         }).collect();
         Ok(movies)
     }
@@ -69,6 +75,12 @@ impl Database {
             title: r.get::<String, _>("title"),
             year: Some(r.get::<i64, _>("year") as u16),
             file_path: std::path::PathBuf::from(r.get::<String, _>("file_path")),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            added_at: 0,
+            file_size: None,
         }).collect();
         Ok(movies)
     }
@@ -89,6 +101,12 @@ mod tests {
             title: "Inception".to_string(),
             year: Some(2010),
             file_path: std::path::PathBuf::from("/movies/inception.mp4"),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            added_at: 0,
+            file_size: None,
         };
         
         db.insert_movie(&movie).await.unwrap();
@@ -120,7 +138,13 @@ mod tests {
             id: 0,
             title: "The Matrix".to_string(),
             year: Some(1999),
-            file_path: std::path::PathBuf::from("/m.mkv")
+            file_path: std::path::PathBuf::from("/m.mkv"),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            added_at: 0,
+            file_size: None,
         };
         db.insert_movie(&m).await.unwrap();
         

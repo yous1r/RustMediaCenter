@@ -118,6 +118,12 @@ mod tests {
             title: "Matrix".to_string(),
             year: Some(1999),
             file_path: std::path::PathBuf::from("/m/matrix.mp4"),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            added_at: 0,
+            file_size: None,
         }).await.unwrap();
 
         let app = app_router(db);
@@ -285,7 +291,18 @@ mod tests {
         
         let db = Database::new("sqlite::memory:").await.unwrap();
         db.init_schema().await.unwrap();
-        db.insert_movie(&rmc_core::models::Movie { id:0, title:"Inception".to_string(), year:Some(2010), file_path:std::path::PathBuf::from("/m.mkv") }).await.unwrap();
+        db.insert_movie(&rmc_core::models::Movie {
+            id: 0,
+            title: "Inception".to_string(),
+            year: Some(2010),
+            file_path: std::path::PathBuf::from("/m.mkv"),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            added_at: 0,
+            file_size: None,
+        }).await.unwrap();
         
         let app = super::app_router(db); 
         

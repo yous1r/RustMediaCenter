@@ -27,6 +27,12 @@ impl TmdbScraper {
             title: title.to_string(),
             year: Some(2023),
             file_path: std::path::PathBuf::new(),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            added_at: 0,
+            file_size: None,
         })
     }
 }

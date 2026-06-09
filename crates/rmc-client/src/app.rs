@@ -102,6 +102,12 @@ mod tests {
             title: "Test Movie".to_string(),
             year: Some(2025),
             file_path: std::path::PathBuf::from("/m/test.mp4"),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            added_at: 0,
+            file_size: None,
         }];
         
         let _ = app.update(Message::MoviesLoaded(Ok(test_movies)));

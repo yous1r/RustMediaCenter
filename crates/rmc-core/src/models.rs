@@ -6,6 +6,12 @@ pub struct Movie {
     pub title: String,
     pub year: Option<u16>,
     pub file_path: std::path::PathBuf,
+    pub poster_url: Option<String>,
+    pub overview: Option<String>,
+    pub tmdb_id: Option<i64>,
+    pub runtime_minutes: Option<u16>,
+    pub added_at: i64,
+    pub file_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,9 +39,21 @@ mod tests {
             title: "Test Movie".to_string(),
             year: Some(2024),
             file_path: std::path::PathBuf::from("/path/to/movie.mp4"),
+            poster_url: Some("https://example.com/poster.jpg".to_string()),
+            overview: Some("This is a test movie overview".to_string()),
+            tmdb_id: Some(12345),
+            runtime_minutes: Some(120),
+            added_at: 1718021000,
+            file_size: Some(1024000),
         };
         let json = serde_json::to_string(&movie).unwrap();
         assert!(json.contains(r#""title":"Test Movie""#));
+        assert!(json.contains(r#""poster_url":"https://example.com/poster.jpg""#));
+        assert!(json.contains(r#""overview":"This is a test movie overview""#));
+        assert!(json.contains(r#""tmdb_id":12345"#));
+        assert!(json.contains(r#""runtime_minutes":120"#));
+        assert!(json.contains(r#""added_at":1718021000"#));
+        assert!(json.contains(r#""file_size":1024000"#));
         
         let deserialized: Movie = serde_json::from_str(&json).unwrap();
         assert_eq!(movie, deserialized);

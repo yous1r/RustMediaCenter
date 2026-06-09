@@ -23,6 +23,12 @@ mod tests {
                 title: "Test".to_string(),
                 year: Some(2024),
                 file_path: std::path::PathBuf::from("/test.mp4"),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                added_at: 0,
+                file_size: None,
             },
             stream_url: "/stream/1/direct".to_string(),
         };
