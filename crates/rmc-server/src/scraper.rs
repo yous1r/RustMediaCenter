@@ -1,6 +1,9 @@
 use rmc_core::models::Movie;
 use serde::Deserialize;
 
+const TMDB_API_URL: &str = "https://api.themoviedb.org/3/search/movie";
+const TMDB_IMAGE_BASE: &str = "https://image.tmdb.org/t/p/w500";
+
 pub struct TmdbScraper {
     api_key: String,
     client: reqwest::Client,
@@ -22,27 +25,33 @@ struct TmdbMovie {
 
 impl TmdbScraper {
     pub fn new(api_key: String) -> Self {
-        Self {
-            api_key,
-            client: reqwest::Client::new(),
-        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { api_key, client }
     }
 
     pub async fn fetch_movie_metadata(&self, title: &str) -> Result<Movie, Box<dyn std::error::Error + Send + Sync>> {
-        let encoded_title = urlencoding::encode(title);
-        let url = format!(
-            "https://api.themoviedb.org/3/search/movie?api_key={}&query={}&language=zh-CN",
-            self.api_key, encoded_title
-        );
+        let response = self.client.get(TMDB_API_URL)
+            .query(&[
+                ("api_key", self.api_key.as_str()),
+                ("query", title),
+                ("language", "zh-CN"),
+            ])
+            .send()
+            .await?;
         
-        let response = self.client.get(&url).send().await?;
         if !response.status().is_success() {
             let status = response.status();
             let err_body = response.text().await.unwrap_or_default();
             return Err(format!("TMDB API error: status code {}, response: {}", status, err_body).into());
         }
         
-        let search_response: TmdbSearchResponse = response.json().await?;
+        let text = response.text().await?;
+        let search_response: TmdbSearchResponse = serde_json::from_str(&text)
+            .map_err(|e| format!("Failed to parse TMDB JSON response: {}, response body: {}", e, text))?;
+            
         if search_response.results.is_empty() {
             return Err("No matching movie found on TMDB".into());
         }
@@ -50,15 +59,11 @@ impl TmdbScraper {
         let best_match = &search_response.results[0];
         
         let poster_url = best_match.poster_path.as_ref().map(|path| {
-            format!("https://image.tmdb.org/t/p/w500{}", path)
+            format!("{}{}", TMDB_IMAGE_BASE, path)
         });
 
         let year = best_match.release_date.as_ref().and_then(|date| {
-            if date.len() >= 4 {
-                date[0..4].parse::<u16>().ok()
-            } else {
-                None
-            }
+            date.split('-').next().and_then(|y| y.parse::<u16>().ok())
         });
 
         Ok(Movie {
