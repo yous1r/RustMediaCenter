@@ -7,6 +7,7 @@ pub mod scraper;
 pub mod config;
 pub mod error;
 pub mod auth;
+pub mod scanner;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
