@@ -260,7 +260,11 @@ pub async fn trigger_scan(
         if let Some(api_key) = &config.tmdb_api_key {
             if !api_key.trim().is_empty() {
                 tracing::info!("Starting background metadata scraping...");
-                let scraper = crate::scraper::TmdbScraper::new(api_key.clone());
+                let scraper = crate::scraper::TmdbScraper::new(
+                    api_key.clone(),
+                    config.tmdb_proxy_url.clone(),
+                    config.tmdb_api_base.clone(),
+                );
                 match db_clone.get_movies_without_metadata().await {
                     Ok(movies) => {
                         for movie in movies {
