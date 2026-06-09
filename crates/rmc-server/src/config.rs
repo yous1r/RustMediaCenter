@@ -8,6 +8,8 @@ pub struct ServerConfig {
     pub media_dirs: Vec<String>,
     pub db_path: String,
     pub tmdb_api_key: Option<String>,
+    pub tmdb_proxy_url: Option<String>,
+    pub tmdb_api_base: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -17,6 +19,8 @@ impl Default for ServerConfig {
             media_dirs: vec!["/media".to_string()],
             db_path: "rmc.db".to_string(),
             tmdb_api_key: None,
+            tmdb_proxy_url: None,
+            tmdb_api_base: None,
         }
     }
 }
@@ -56,6 +60,8 @@ mod tests {
         assert_eq!(config.media_dirs, vec!["/media".to_string()]);
         assert_eq!(config.db_path, "rmc.db");
         assert_eq!(config.tmdb_api_key, None);
+        assert_eq!(config.tmdb_proxy_url, None);
+        assert_eq!(config.tmdb_api_base, None);
     }
 
     #[test]
@@ -69,6 +75,8 @@ mod tests {
         assert_eq!(config.media_dirs, vec!["/media".to_string()]);
         assert_eq!(config.db_path, "rmc.db".to_string());
         assert_eq!(config.tmdb_api_key, None);
+        assert_eq!(config.tmdb_proxy_url, None);
+        assert_eq!(config.tmdb_api_base, None);
         assert!(config_path.exists());
 
         // 2. 修改配置并保存
@@ -76,6 +84,8 @@ mod tests {
         config.media_dirs = vec!["/media1".to_string(), "/media2".to_string()];
         config.db_path = "rmc_test.db".to_string();
         config.tmdb_api_key = Some("test_api_key".to_string());
+        config.tmdb_proxy_url = Some("http://proxy.example.com".to_string());
+        config.tmdb_api_base = Some("https://api.example.com".to_string());
         config.save_to(&config_path).unwrap();
 
         // 3. 再次加载，确保读取修改后的配置
@@ -84,6 +94,8 @@ mod tests {
         assert_eq!(loaded.media_dirs, vec!["/media1".to_string(), "/media2".to_string()]);
         assert_eq!(loaded.db_path, "rmc_test.db".to_string());
         assert_eq!(loaded.tmdb_api_key, Some("test_api_key".to_string()));
+        assert_eq!(loaded.tmdb_proxy_url, Some("http://proxy.example.com".to_string()));
+        assert_eq!(loaded.tmdb_api_base, Some("https://api.example.com".to_string()));
     }
 }
 
