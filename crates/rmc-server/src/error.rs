@@ -13,6 +13,9 @@ pub enum AppError {
     
     #[error("Not Found: {0}")]
     NotFound(String),
+
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
 }
 
 impl IntoResponse for AppError {
@@ -20,6 +23,7 @@ impl IntoResponse for AppError {
         let (status, error_message) = match &self {
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, "Not Found"),
+            AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "Unauthorized"),
         };
 
         let body = Json(json!({
@@ -41,5 +45,12 @@ mod tests {
         let err = AppError::Internal(anyhow::anyhow!("test error"));
         let res = err.into_response();
         assert_eq!(res.status(), 500);
+    }
+
+    #[test]
+    fn test_unauthorized_error_response() {
+        let err = AppError::Unauthorized("missing token".to_string());
+        let res = err.into_response();
+        assert_eq!(res.status(), 401);
     }
 }

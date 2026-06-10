@@ -2,6 +2,12 @@ use iced::{Task, Element};
 use iced::widget::{text, column, scrollable, container};
 use rmc_core::models::Movie;
 
+const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:19000";
+
+fn server_base_url() -> String {
+    std::env::var("RMC_SERVER_URL").unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string())
+}
+
 pub struct RmcApp {
     pub movies: Vec<Movie>,
     pub error_message: Option<String>,
@@ -28,7 +34,7 @@ impl RmcApp {
             Self::default(),
             Task::perform(
                 async {
-                    let client = crate::api_client::ApiClient::new("http://127.0.0.1:8000".to_string());
+                    let client = crate::api_client::ApiClient::new(server_base_url());
                     client.fetch_movies().await
                 },
                 Message::MoviesLoaded,
@@ -42,7 +48,7 @@ impl RmcApp {
                 self.error_message = None;
                 Task::perform(
                     async {
-                        let client = crate::api_client::ApiClient::new("http://127.0.0.1:8000".to_string());
+                        let client = crate::api_client::ApiClient::new(server_base_url());
                         client.fetch_movies().await
                     },
                     Message::MoviesLoaded,

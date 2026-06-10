@@ -12,6 +12,11 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LoginResponse {
+    pub token: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -34,5 +39,14 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("stream_url"));
+    }
+
+    #[test]
+    fn test_login_response_serialization() {
+        let resp = LoginResponse {
+            token: "jwt-token".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("jwt-token"));
     }
 }

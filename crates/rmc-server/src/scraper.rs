@@ -57,7 +57,8 @@ impl TmdbScraper {
                 ("language", "zh-CN"),
             ])
             .send()
-            .await?;
+            .await
+            .map_err(|e| format!("TMDB request failed for {}: {}", url, e))?;
         
         if !response.status().is_success() {
             let status = response.status();
@@ -117,7 +118,11 @@ mod tests {
         assert!(res.is_err());
         let err_msg = res.unwrap_err().to_string();
         assert!(
-            err_msg.contains("401") || err_msg.contains("Unauthorized") || err_msg.contains("API key") || err_msg.contains("status code"),
+            err_msg.contains("401")
+                || err_msg.contains("Unauthorized")
+                || err_msg.contains("API key")
+                || err_msg.contains("status code")
+                || err_msg.contains("TMDB request failed"),
             "Error message was not clear: {}",
             err_msg
         );
@@ -151,7 +156,11 @@ mod tests {
         assert!(res.is_err());
         let err_msg = res.unwrap_err().to_string();
         assert!(
-            err_msg.contains("401") || err_msg.contains("Unauthorized") || err_msg.contains("API key") || err_msg.contains("status code"),
+            err_msg.contains("401")
+                || err_msg.contains("Unauthorized")
+                || err_msg.contains("API key")
+                || err_msg.contains("status code")
+                || err_msg.contains("TMDB request failed"),
             "Error message was not clear: {}",
             err_msg
         );

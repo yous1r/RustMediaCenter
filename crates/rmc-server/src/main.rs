@@ -1,4 +1,5 @@
 mod api;
+mod emby;
 mod db;
 pub mod strm;
 pub mod watcher;
