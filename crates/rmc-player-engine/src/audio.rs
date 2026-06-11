@@ -31,7 +31,7 @@ impl AudioOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_audio_output_init() {
         let audio = AudioOutput::new();
@@ -45,4 +45,3 @@ mod tests {
         assert!(output.has_device());
     }
 }
-

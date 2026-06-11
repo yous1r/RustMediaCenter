@@ -1,10 +1,10 @@
-use notify::{RecommendedWatcher, RecursiveMode, Watcher, Config};
-use std::sync::atomic::{AtomicBool, Ordering};
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const SCAN_QUEUE_CAPACITY: usize = 100;
 const VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg", "strm"
+    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg", "strm",
 ];
 
 pub struct MediaWatcher {
@@ -33,21 +33,24 @@ impl MediaWatcher {
         }
     }
 
-    pub fn start(&mut self, dirs: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn start(
+        &mut self,
+        dirs: &[String],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-        
+
         for dir in dirs {
             watcher.watch(Path::new(dir), RecursiveMode::Recursive)?;
         }
-        
+
         let handle = tokio::runtime::Handle::current();
         let (scan_tx, mut scan_rx) = tokio::sync::mpsc::channel::<String>(SCAN_QUEUE_CAPACITY);
-        
+
         // Spawn background task to process scan requests sequentially
         let db_clone = self.db.clone();
         handle.spawn(async move {
@@ -62,10 +65,10 @@ impl MediaWatcher {
             }
             tracing::info!("Background scan consumer stopped");
         });
-        
+
         tokio::task::spawn_blocking(move || {
             tracing::info!("Event watcher thread started");
-            
+
             while let Ok(res) = rx.recv() {
                 match res {
                     Ok(event) => {
@@ -79,7 +82,10 @@ impl MediaWatcher {
                                             let parent_str = parent.to_string_lossy().to_string();
                                             tracing::debug!("Valid video file modified: {:?}, queueing parent scan: {}", path, parent_str);
                                             if let Err(e) = scan_tx.try_send(parent_str) {
-                                                tracing::warn!("Failed to queue directory scan: {:?}", e);
+                                                tracing::warn!(
+                                                    "Failed to queue directory scan: {:?}",
+                                                    e
+                                                );
                                             }
                                         }
                                     }
@@ -98,7 +104,7 @@ impl MediaWatcher {
 
         self.watcher = Some(watcher);
         self.running.store(true, Ordering::SeqCst);
-        
+
         Ok(())
     }
 
@@ -125,7 +131,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = crate::db::Database::new("sqlite::memory:").await.unwrap();
         db.init_schema().await.unwrap();
-        
+
         let mut watcher = MediaWatcher::new(db);
         // 尝试启动 watcher
         let res = watcher.start(&[temp_dir.path().to_string_lossy().to_string()]);
@@ -157,7 +163,11 @@ mod tests {
         let mut found = false;
         for _ in 0..20 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if db.movie_exists_by_path(&file_path.to_string_lossy()).await.unwrap() {
+            if db
+                .movie_exists_by_path(&file_path.to_string_lossy())
+                .await
+                .unwrap()
+            {
                 found = true;
                 break;
             }
@@ -167,6 +177,9 @@ mod tests {
         drop(watcher);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        assert!(found, "The movie file was not auto-detected and inserted into database");
+        assert!(
+            found,
+            "The movie file was not auto-detected and inserted into database"
+        );
     }
 }

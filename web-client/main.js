@@ -9,6 +9,14 @@ const API_BASE_STORAGE_KEY = 'rmc_api_base';
 const API_BASE_QUERY_KEY = 'apiBase';
 const DEFAULT_SERVER_PORT = '19000';
 const API_DISCOVERY_TIMEOUT_MS = 1500;
+const PLAYER_UI_IDLE_MS = 3000;
+const TRANSCODE_QUALITY_OPTIONS = [
+  { value: 'source', label: '原始' },
+  { value: '1080p', label: '1080P' },
+  { value: '720p', label: '720P' },
+  { value: '480p', label: '480P' },
+  { value: '360p', label: '360P' },
+];
 
 // 防御 DOM-based XSS 的 Html 转义辅助函数
 function escapeHtml(str) {
@@ -22,29 +30,132 @@ function escapeHtml(str) {
 }
 
 // 全局状态
-let movies = [];
+const LIBRARY_PAGE_SIZE = 24;
 let currentQuery = '';
 let playerInstance = null;
 let resolvedApiBasePromise = null;
+let lastBrowseHash = '#/';
+let lastDetailHash = '#/';
+let homeLibraryState = createHomeLibraryState();
+
+function createHomeLibraryState() {
+  return {
+    items: [],
+    totalRecordCount: 0,
+    loading: false,
+  };
+}
+
+function rememberBrowseHash() {
+  lastBrowseHash = window.location.hash || '#/';
+}
+
+function rememberDetailHash() {
+  lastDetailHash = window.location.hash || '#/';
+}
+
+function destroyPlayerInstance() {
+  if (!playerInstance) return;
+
+  try {
+    playerInstance.pause?.();
+    playerInstance.destroy?.();
+  } catch (err) {
+    console.error('Failed to destroy player instance', err);
+  }
+
+  playerInstance = null;
+}
 
 function renderPlayerError(message) {
-  const container = document.querySelector('#xgplayer-el');
+  const container = document.querySelector('#player-shell');
   if (!container) return;
   container.innerHTML = `
-    <div class="error-container" style="height:100%; display:flex; align-items:center; justify-content:center; padding:2rem; text-align:center;">
+    <div class="error-container player-error-state">
       <div>
-        <p style="font-size:1.05rem; margin-bottom:0.75rem;">播放器初始化失败</p>
+        <p style="font-size:1.05rem; margin-bottom:0.75rem;">播放器不可用</p>
         <p style="color: var(--text-secondary);">${escapeHtml(message)}</p>
       </div>
     </div>
   `;
 }
 
-function resolvePlayerCtor(mode) {
-  if (mode === 'transcode') {
-    return window.Player || window.HlsPlayer || null;
+function formatPlaybackTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '00:00';
+
+  const rounded = Math.floor(seconds);
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const secs = rounded % 60;
+
+  if (hours > 0) {
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   }
-  return window.Player || null;
+
+  return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+function getTranscodeQualityLabel(quality) {
+  return TRANSCODE_QUALITY_OPTIONS.find((item) => item.value === quality)?.label || '原始';
+}
+
+function buildTranscodeStreamPath(movieId, startTimeSeconds = 0, quality = 'source') {
+  const params = new URLSearchParams();
+  if (Number.isFinite(startTimeSeconds) && startTimeSeconds > 0) {
+    params.set('start_time', startTimeSeconds.toFixed(3));
+  }
+  if (quality && quality !== 'source') {
+    params.set('quality', quality);
+  }
+
+  const query = params.toString();
+  return query
+    ? `/api/v1/movies/${movieId}/stream.mp4?${query}`
+    : `/api/v1/movies/${movieId}/stream.mp4`;
+}
+
+function setRangeProgress(input) {
+  if (!input) return;
+
+  const min = Number(input.min || 0);
+  const max = Number(input.max || 100);
+  const value = Number(input.value || 0);
+  const percent = max <= min ? 0 : ((value - min) / (max - min)) * 100;
+  input.style.setProperty('--range-progress', `${Math.max(0, Math.min(100, percent))}%`);
+}
+
+async function toggleFullscreen(element) {
+  if (!element) return;
+
+  if (document.fullscreenElement === element) {
+    await document.exitFullscreen();
+    return;
+  }
+
+  await element.requestFullscreen?.();
+}
+
+function isMobileViewport() {
+  return window.matchMedia('(max-width: 900px)').matches;
+}
+
+function getViewportOrientation() {
+  return window.matchMedia('(orientation: portrait)').matches ? 'portrait' : 'landscape';
+}
+
+function updatePlayerViewportClasses(container, video) {
+  if (!container) return;
+
+  const mobile = isMobileViewport();
+  const orientation = getViewportOrientation();
+  const hasVideoMetadata = Number.isFinite(video?.videoWidth) && Number.isFinite(video?.videoHeight) && video.videoWidth > 0 && video.videoHeight > 0;
+  const portraitVideo = hasVideoMetadata ? video.videoHeight > video.videoWidth : false;
+
+  container.classList.toggle('player-mobile', mobile);
+  container.classList.toggle('player-mobile-portrait', mobile && orientation === 'portrait');
+  container.classList.toggle('player-mobile-landscape', mobile && orientation === 'landscape');
+  container.classList.toggle('player-video-portrait', portraitVideo);
+  container.classList.toggle('player-video-landscape', hasVideoMetadata && !portraitVideo);
 }
 
 function normalizeApiBase(base) {
@@ -180,6 +291,447 @@ async function authorizedFetch(url, options = {}) {
   });
 }
 
+function getLibraryKindLabel(kind) {
+  switch (kind) {
+    case 'movie':
+      return 'Movie';
+    case 'series':
+      return 'Series';
+    case 'season':
+      return 'Season';
+    case 'episode':
+      return 'Episode';
+    default:
+      return 'Library';
+  }
+}
+
+function formatRuntime(runtimeSeconds, runtimeMinutes) {
+  const secondsValue = Number(runtimeSeconds);
+  if (Number.isFinite(secondsValue) && secondsValue > 0) {
+    const hours = Math.floor(secondsValue / 3600);
+    const minutes = Math.floor((secondsValue % 3600) / 60);
+    const seconds = secondsValue % 60;
+    const parts = [];
+
+    if (hours > 0) parts.push(`${hours}h`);
+    if (minutes > 0 || hours > 0) parts.push(`${minutes}m`);
+    parts.push(`${seconds}s`);
+    return parts.join(' ');
+  }
+
+  const minutesValue = Number(runtimeMinutes);
+  if (!Number.isFinite(minutesValue) || minutesValue <= 0) return '';
+
+  const hours = Math.floor(minutesValue / 60);
+  const minutes = minutesValue % 60;
+
+  if (hours > 0 && minutes > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (hours > 0) {
+    return `${hours}h`;
+  }
+  return `${minutes}m`;
+}
+
+function formatLibraryItemMeta(item) {
+  const parts = [];
+  const runtime = formatRuntime(item.runtime_seconds, item.runtime_minutes);
+
+  if (item.kind === 'movie') {
+    if (item.year) parts.push(String(item.year));
+    if (runtime) parts.push(runtime);
+    return parts.join(' • ') || 'Feature film';
+  }
+
+  if (item.kind === 'series') {
+    if (item.child_count > 0) {
+      parts.push(`${item.child_count} ${item.child_count === 1 ? 'season' : 'seasons'}`);
+    }
+    if (item.year) parts.push(String(item.year));
+    return parts.join(' • ') || 'Series collection';
+  }
+
+  if (item.kind === 'season') {
+    if (Number.isFinite(Number(item.season_number))) {
+      parts.push(`Season ${item.season_number}`);
+    }
+    if (item.child_count > 0) {
+      parts.push(`${item.child_count} ${item.child_count === 1 ? 'episode' : 'episodes'}`);
+    }
+    return parts.join(' • ') || 'Season';
+  }
+
+  if (item.kind === 'episode') {
+    if (Number.isFinite(Number(item.season_number)) && Number.isFinite(Number(item.episode_number))) {
+      parts.push(`S${String(item.season_number).padStart(2, '0')}E${String(item.episode_number).padStart(2, '0')}`);
+    } else if (Number.isFinite(Number(item.episode_number))) {
+      parts.push(`Episode ${item.episode_number}`);
+    }
+    if (runtime) parts.push(runtime);
+    return parts.join(' • ') || 'Episode';
+  }
+
+  return getLibraryKindLabel(item.kind);
+}
+
+function buildLibraryItemsPath({ parentId = null, searchTerm = '', startIndex = 0, limit } = {}) {
+  const params = new URLSearchParams();
+
+  if (parentId) {
+    params.set('parent_id', parentId);
+  }
+  if (searchTerm && searchTerm.trim()) {
+    params.set('search_term', searchTerm.trim());
+  }
+  if (startIndex > 0) {
+    params.set('start_index', String(startIndex));
+  }
+  if (Number.isFinite(limit) && limit > 0) {
+    params.set('limit', String(limit));
+  }
+
+  const query = params.toString();
+  return query ? `/api/v1/library/items?${query}` : '/api/v1/library/items';
+}
+
+async function fetchLibraryItems(options = {}) {
+  const response = await apiFetch(buildLibraryItemsPath(options));
+  if (!response.ok) {
+    throw new Error(`Failed to load library items: ${response.status}`);
+  }
+  return response.json();
+}
+
+async function fetchLibraryItem(id) {
+  const response = await apiFetch(`/api/v1/library/items/${encodeURIComponent(id)}`);
+  if (!response.ok) {
+    throw new Error(`Failed to load library item: ${response.status}`);
+  }
+  return response.json();
+}
+
+function renderPoster(posterUrl, title, className = 'movie-poster') {
+  if (posterUrl) {
+    return `<div class="${className}" style="background-image: url('${encodeURI(posterUrl)}')"></div>`;
+  }
+
+  return `<div class="${className} placeholder-poster">${escapeHtml((title || '?').charAt(0).toUpperCase())}</div>`;
+}
+
+function buildLibraryItemHref(item) {
+  const playId = Number(item.play_id);
+
+  if (item.kind === 'movie' && Number.isFinite(playId)) {
+    return `#/movie/${playId}`;
+  }
+  if (item.kind === 'series') {
+    return `#/series/${encodeURIComponent(item.id)}`;
+  }
+  if (item.kind === 'season') {
+    return `#/season/${encodeURIComponent(item.id)}`;
+  }
+  if (item.kind === 'episode' && Number.isFinite(playId)) {
+    return `#/play/${playId}/direct`;
+  }
+
+  return '#/';
+}
+
+function renderLibraryCard(item) {
+  const actionLabel = item.kind === 'episode' ? 'Play now' : 'Open';
+  const description = item.overview
+    ? `<p class="library-card-description">${escapeHtml(item.overview)}</p>`
+    : '';
+
+  return `
+    <a href="${buildLibraryItemHref(item)}" class="movie-card library-card" style="text-decoration: none;">
+      ${renderPoster(item.poster_url, item.title)}
+      <div class="movie-info">
+        <span class="library-card-badge">${escapeHtml(getLibraryKindLabel(item.kind))}</span>
+        <h3 class="movie-title">${escapeHtml(item.title)}</h3>
+        <span class="library-card-meta">${escapeHtml(formatLibraryItemMeta(item))}</span>
+        ${description}
+        <span class="library-card-action">${escapeHtml(actionLabel)}</span>
+      </div>
+    </a>
+  `;
+}
+
+function renderLibraryDetailHero({ item, backHref, backLabel, overviewFallback, metaBadges = [] }) {
+  return `
+    <div class="movie-detail-hero library-detail-hero">
+      ${renderPoster(item.poster_url, item.title, 'movie-detail-poster')}
+      <div class="movie-detail-info">
+        <a href="${backHref}" class="back-link">${escapeHtml(backLabel)}</a>
+        <h1 class="movie-detail-title">${escapeHtml(item.title)}</h1>
+        <div class="movie-detail-meta">
+          ${metaBadges.filter(Boolean).map(value => `<span class="movie-detail-badge">${escapeHtml(value)}</span>`).join('')}
+        </div>
+        <p class="movie-detail-overview">${escapeHtml(item.overview || overviewFallback)}</p>
+      </div>
+    </div>
+  `;
+}
+
+function renderLibrarySection({ title, countLabel, contentClass = 'movies-grid', contentHtml, emptyMessage }) {
+  return `
+    <section class="library-section">
+      <div class="library-section-header">
+        <h2>${escapeHtml(title)}</h2>
+        <span class="library-section-count">${escapeHtml(countLabel)}</span>
+      </div>
+      ${contentHtml ? `
+        <div class="${contentClass}">
+          ${contentHtml}
+        </div>
+      ` : `
+        <div class="library-empty-state">
+          <p>${escapeHtml(emptyMessage)}</p>
+        </div>
+      `}
+    </section>
+  `;
+}
+
+function renderEpisodeList(episodes) {
+  return episodes.map((episode) => {
+    const playId = Number(episode.play_id);
+    const href = Number.isFinite(playId) ? `#/play/${playId}/direct` : '#/';
+    const indexLabel = Number.isFinite(Number(episode.episode_number))
+      ? `Episode ${episode.episode_number}`
+      : 'Episode';
+
+    return `
+      <a href="${href}" class="library-episode-row" style="text-decoration: none;">
+        <div class="library-episode-index">${escapeHtml(indexLabel)}</div>
+        <div class="library-episode-main">
+          <h3>${escapeHtml(episode.title)}</h3>
+          <p>${escapeHtml(episode.overview || 'Open this episode in the player.')}</p>
+        </div>
+        <div class="library-episode-meta">${escapeHtml(formatLibraryItemMeta(episode))}</div>
+      </a>
+    `;
+  }).join('');
+}
+
+function renderHomeLibraryContent() {
+  const contentEl = document.querySelector('#content');
+  if (!contentEl) return;
+
+  const loadedCount = homeLibraryState.items.length;
+  const totalCount = homeLibraryState.totalRecordCount;
+  const hasMore = loadedCount < totalCount;
+
+  if (loadedCount === 0) {
+    contentEl.innerHTML = `
+      <div class="library-empty-state">
+        <p>${escapeHtml(currentQuery ? 'No movies or series matched your search.' : 'No media found in your library yet.')}</p>
+      </div>
+    `;
+    return;
+  }
+
+  const secondaryMeta = currentQuery
+    ? `Search: ${currentQuery}`
+    : `Loaded ${loadedCount}${totalCount ? ` / ${totalCount}` : ''}`;
+
+  contentEl.innerHTML = `
+    <div class="library-results-meta">
+      <span>${loadedCount}${totalCount ? ` of ${totalCount}` : ''} items</span>
+      <span>${escapeHtml(secondaryMeta)}</span>
+    </div>
+    <div class="movies-grid">
+      ${homeLibraryState.items.map(renderLibraryCard).join('')}
+    </div>
+    ${hasMore ? `
+      <div class="load-more-wrap">
+        <button type="button" id="load-more-library" class="load-more-btn" ${homeLibraryState.loading ? 'disabled' : ''}>
+          ${homeLibraryState.loading ? 'Loading…' : 'Load more'}
+        </button>
+      </div>
+    ` : ''}
+  `;
+
+  const loadMoreButton = document.querySelector('#load-more-library');
+  if (loadMoreButton) {
+    loadMoreButton.addEventListener('click', async () => {
+      await loadAndRenderHomeItems();
+    });
+  }
+}
+
+async function loadAndRenderHomeItems({ reset = false } = {}) {
+  const contentEl = document.querySelector('#content');
+  if (!contentEl || homeLibraryState.loading) return;
+
+  if (reset) {
+    homeLibraryState = createHomeLibraryState();
+    contentEl.innerHTML = `
+      <div class="loading-container">
+        <div class="spinner"></div>
+        <p>Loading your library...</p>
+      </div>
+    `;
+  } else if (homeLibraryState.totalRecordCount > 0 && homeLibraryState.items.length >= homeLibraryState.totalRecordCount) {
+    return;
+  }
+
+  homeLibraryState.loading = true;
+  if (!reset && homeLibraryState.items.length > 0) {
+    renderHomeLibraryContent();
+  }
+
+  try {
+    const payload = await fetchLibraryItems({
+      searchTerm: currentQuery,
+      startIndex: reset ? 0 : homeLibraryState.items.length,
+      limit: LIBRARY_PAGE_SIZE,
+    });
+
+    homeLibraryState.items = reset
+      ? payload.items
+      : [...homeLibraryState.items, ...payload.items];
+    homeLibraryState.totalRecordCount = payload.total_record_count || homeLibraryState.items.length;
+  } catch (err) {
+    console.error('Failed to fetch library items', err);
+    contentEl.innerHTML = `
+      <div class="error-container">
+        <p>Failed to load library items. Please check connection.</p>
+      </div>
+    `;
+    homeLibraryState.loading = false;
+    return;
+  }
+
+  homeLibraryState.loading = false;
+  renderHomeLibraryContent();
+}
+
+async function renderSeriesPage(app, id) {
+  rememberBrowseHash();
+  rememberDetailHash();
+
+  app.innerHTML = `
+    ${renderNav()}
+    <main class="page-fade-in">
+      <div id="detail-content">
+        <div class="loading-container">
+          <div class="spinner"></div>
+          <p>Loading series...</p>
+        </div>
+      </div>
+    </main>
+  `;
+
+  const detailContentEl = document.querySelector('#detail-content');
+  if (!detailContentEl) return;
+
+  try {
+    const [item, childResponse] = await Promise.all([
+      fetchLibraryItem(id),
+      fetchLibraryItems({ parentId: id, limit: 500 }),
+    ]);
+
+    if (item.kind !== 'series') {
+      throw new Error(`Expected series item but received ${item.kind}`);
+    }
+
+    const children = childResponse.items || [];
+    const metaBadges = [formatLibraryItemMeta(item)];
+
+    detailContentEl.innerHTML = `
+      ${renderLibraryDetailHero({
+        item,
+        backHref: '#/',
+        backLabel: '← Back to Library',
+        overviewFallback: 'Browse the seasons available in this series.',
+        metaBadges,
+      })}
+      ${renderLibrarySection({
+        title: 'Seasons',
+        countLabel: `${children.length} ${children.length === 1 ? 'season' : 'seasons'}`,
+        contentHtml: children.map(renderLibraryCard).join(''),
+        emptyMessage: 'No seasons found for this series.',
+      })}
+    `;
+  } catch (err) {
+    console.error('Failed to load series detail', err);
+    detailContentEl.innerHTML = `
+      <div class="error-container">
+        <p>Failed to load series details.</p>
+        <a href="#/" class="back-link" style="margin-top: 1rem;">← Return to Library</a>
+      </div>
+    `;
+  }
+}
+
+async function renderSeasonPage(app, id) {
+  rememberBrowseHash();
+  rememberDetailHash();
+
+  app.innerHTML = `
+    ${renderNav()}
+    <main class="page-fade-in">
+      <div id="detail-content">
+        <div class="loading-container">
+          <div class="spinner"></div>
+          <p>Loading season...</p>
+        </div>
+      </div>
+    </main>
+  `;
+
+  const detailContentEl = document.querySelector('#detail-content');
+  if (!detailContentEl) return;
+
+  try {
+    const [item, childResponse] = await Promise.all([
+      fetchLibraryItem(id),
+      fetchLibraryItems({ parentId: id, limit: 500 }),
+    ]);
+
+    if (item.kind !== 'season') {
+      throw new Error(`Expected season item but received ${item.kind}`);
+    }
+
+    const episodes = childResponse.items || [];
+    const metaBadges = [formatLibraryItemMeta(item)];
+    if (item.parent_id) {
+      const parentSeries = await fetchLibraryItem(item.parent_id);
+      if (parentSeries?.title) {
+        metaBadges.push(parentSeries.title);
+      }
+    }
+
+    detailContentEl.innerHTML = `
+      ${renderLibraryDetailHero({
+        item,
+        backHref: item.parent_id ? `#/series/${encodeURIComponent(item.parent_id)}` : '#/',
+        backLabel: '← Back to Series',
+        overviewFallback: 'Choose an episode to start playback immediately.',
+        metaBadges,
+      })}
+      ${renderLibrarySection({
+        title: 'Episodes',
+        countLabel: `${episodes.length} ${episodes.length === 1 ? 'episode' : 'episodes'}`,
+        contentClass: 'library-episode-list',
+        contentHtml: renderEpisodeList(episodes),
+        emptyMessage: 'No episodes found for this season.',
+      })}
+    `;
+  } catch (err) {
+    console.error('Failed to load season detail', err);
+    detailContentEl.innerHTML = `
+      <div class="error-container">
+        <p>Failed to load season details.</p>
+        <a href="#/" class="back-link" style="margin-top: 1rem;">← Return to Library</a>
+      </div>
+    `;
+  }
+}
+
 // 路由与渲染导航栏
 function renderNav() {
   return `
@@ -195,26 +747,19 @@ function renderNav() {
 
 // 简单的单页路由 (SPA Router)
 async function router() {
-  // 安全销毁 XGPlayer 实例
-  if (playerInstance) {
-    try {
-      playerInstance.pause();
-      if (playerInstance.video) {
-        playerInstance.video.src = '';
-        playerInstance.video.load();
-      }
-      playerInstance.destroy();
-    } catch (e) {
-      console.error('Failed to destroy player instance', e);
-    }
-    playerInstance = null;
-  }
+  destroyPlayerInstance();
 
   const hash = window.location.hash || '#/';
   const app = document.querySelector('#app');
 
   if (hash === '#/' || hash === '') {
     await renderHomePage(app);
+  } else if (hash.startsWith('#/series/')) {
+    const id = decodeURIComponent(hash.slice('#/series/'.length));
+    await renderSeriesPage(app, id);
+  } else if (hash.startsWith('#/season/')) {
+    const id = decodeURIComponent(hash.slice('#/season/'.length));
+    await renderSeasonPage(app, id);
   } else if (hash.startsWith('#/movie/')) {
     const parts = hash.split('/');
     const id = parseInt(parts[2], 10);
@@ -233,6 +778,8 @@ async function router() {
 
 // 首页渲染
 async function renderHomePage(app) {
+  rememberBrowseHash();
+
   app.innerHTML = `
     ${renderNav()}
     <main class="page-fade-in">
@@ -241,7 +788,7 @@ async function renderHomePage(app) {
         <p class="subtitle">Your personal collection of premium movies and shows</p>
       </header>
       <div class="search-container">
-        <input type="text" id="search-input" class="search-input" placeholder="Search movies..." value="${escapeHtml(currentQuery)}">
+        <input type="text" id="search-input" class="search-input" placeholder="Search movies and series..." value="${escapeHtml(currentQuery)}">
       </div>
       <div id="content">
         <div class="loading-container">
@@ -259,7 +806,7 @@ async function renderHomePage(app) {
     searchInput.setSelectionRange(searchInput.value.length, searchInput.value.length);
   }
 
-  await loadAndRenderMoviesGrid(currentQuery);
+  await loadAndRenderHomeItems({ reset: true });
 }
 
 // 防抖搜索处理
@@ -269,62 +816,14 @@ function handleSearchInput(event) {
   currentQuery = q;
   clearTimeout(searchTimeout);
   searchTimeout = setTimeout(async () => {
-    await loadAndRenderMoviesGrid(q);
+    await loadAndRenderHomeItems({ reset: true });
   }, DEBOUNCE_DELAY_MS);
-}
-
-// 异步加载电影网格并渲染
-async function loadAndRenderMoviesGrid(q) {
-  const contentEl = document.querySelector('#content');
-  if (!contentEl) return;
-
-  try {
-    const url = q ? `/api/v1/movies?q=${encodeURIComponent(q)}` : '/api/v1/movies';
-    const response = await apiFetch(url);
-    if (!response.ok) throw new Error('API error');
-    movies = await response.json();
-
-    if (movies.length === 0) {
-      contentEl.innerHTML = `
-        <div style="text-align: center; color: var(--text-secondary); margin-top: 3rem; font-size: 1.125rem;">
-          No movies found in library.
-        </div>
-      `;
-      return;
-    }
-
-    contentEl.innerHTML = `
-      <div class="movies-grid">
-        ${movies.map(movie => {
-          const hasPoster = movie.poster_url;
-          const posterHtml = hasPoster
-            ? `<div class="movie-poster" style="background-image: url('${encodeURI(movie.poster_url)}')"></div>`
-            : `<div class="movie-poster placeholder-poster">${escapeHtml((movie.title || '?').charAt(0).toUpperCase())}</div>`;
-
-          return `
-            <a href="#/movie/${movie.id}" class="movie-card" style="text-decoration: none;">
-              ${posterHtml}
-              <div class="movie-info">
-                <h3 class="movie-title">${escapeHtml(movie.title)}</h3>
-                <span class="movie-year">${escapeHtml(movie.year || 'Unknown')}</span>
-              </div>
-            </a>
-          `;
-        }).join('')}
-      </div>
-    `;
-  } catch (err) {
-    console.error('Failed to fetch movies', err);
-    contentEl.innerHTML = `
-      <div class="error-container">
-        <p>Failed to load movies. Please check connection.</p>
-      </div>
-    `;
-  }
 }
 
 // 电影详情页渲染
 async function renderDetailPage(app, id) {
+  rememberDetailHash();
+
   app.innerHTML = `
     ${renderNav()}
     <main class="page-fade-in">
@@ -351,15 +850,17 @@ async function renderDetailPage(app, id) {
       : `<div class="movie-detail-poster placeholder-poster">${escapeHtml((movie.title || '?').charAt(0).toUpperCase())}</div>`;
 
     const sizeStr = formatSize(movie.file_size);
+    const runtimeStr = formatRuntime(movie.runtime_seconds, movie.runtime_minutes);
 
     detailContentEl.innerHTML = `
       <div class="movie-detail-hero">
         ${posterHtml}
         <div class="movie-detail-info">
-          <a href="#/" class="back-link">← Back to Library</a>
+          <a href="${escapeHtml(lastBrowseHash || '#/')}" class="back-link">← Back to Library</a>
           <h1 class="movie-detail-title">${escapeHtml(movie.title)}</h1>
           <div class="movie-detail-meta">
             <span class="movie-detail-year">${escapeHtml(movie.year || 'Unknown')}</span>
+            ${runtimeStr ? `<span class="movie-detail-badge">${escapeHtml(runtimeStr)}</span>` : ''}
             <span class="movie-detail-badge">${escapeHtml(sizeStr)}</span>
             <span class="movie-detail-badge">4K HDR</span>
           </div>
@@ -403,53 +904,480 @@ function formatSize(bytes) {
 
 // 播放页面渲染
 async function renderPlayerPage(app, id, mode) {
-  const streamPath = mode === 'transcode'
-    ? `/api/v1/movies/${id}/stream.mp4`
-    : `/api/v1/movies/${id}/direct`;
+  const isTranscodeMode = mode === 'transcode';
+  const modeLabel = isTranscodeMode ? '转码模式' : '直刷模式';
+  const modeHint = isTranscodeMode
+    ? '服务端实时转码为 MP4 流；拖动或快进会从目标时间重新建立转码会话。'
+    : '浏览器直接解码原文件，零额外处理但取决于格式兼容性。';
+  let selectedTranscodeQuality = 'source';
+  const moviePromise = apiFetch(`/api/v1/movies/${id}`)
+    .then(async (response) => {
+      if (!response.ok) return null;
+      return response.json();
+    })
+    .catch((err) => {
+      console.warn('Failed to preload movie metadata for player', err);
+      return null;
+    });
 
   app.innerHTML = `
     <div class="player-container page-fade-in">
-      <a href="#/movie/${id}" class="player-back">← Back</a>
-      <div id="xgplayer-el" style="width: 100%; height: 100%;"></div>
-      
-      <div class="player-mode-switch">
-        <a href="#/play/${id}/direct" class="player-btn ${mode === 'direct' ? 'active' : ''}">直刷模式 (客户端解码)</a>
-        <a href="#/play/${id}/transcode" class="player-btn ${mode === 'transcode' ? 'active' : ''}">转码模式 (核显硬解)</a>
+      <div class="player-topbar">
+        <a href="${escapeHtml(lastDetailHash || `#/movie/${id}`)}" class="player-back">← 返回详情</a>
+        <div class="player-status">
+          <span class="player-status-pill">${modeLabel}</span>
+          <span id="player-runtime-note" class="player-runtime-note">${modeHint}</span>
+        </div>
+      </div>
+      <div class="player-stage">
+        <div id="player-shell" class="player-shell">
+          <video id="player-video" class="video-player" playsinline preload="metadata"></video>
+          <button type="button" id="player-center-toggle" class="player-center-toggle">播放</button>
+          <div class="player-controls">
+            <div class="player-progress-row">
+              <span id="player-current-time" class="player-time">00:00</span>
+              <input id="player-progress" class="player-range player-progress" type="range" min="0" max="1000" value="0" step="1" aria-label="播放进度">
+              <span id="player-duration" class="player-time">00:00</span>
+            </div>
+            <div class="player-controls-row">
+              <div class="player-controls-group">
+                <button type="button" id="player-play-toggle" class="player-control">播放</button>
+                <button type="button" id="player-mute-toggle" class="player-control">静音</button>
+                <input id="player-volume" class="player-range player-volume" type="range" min="0" max="100" value="100" step="1" aria-label="音量">
+              </div>
+              <div class="player-controls-group">
+                <button type="button" id="player-pip-toggle" class="player-control">画中画</button>
+                <button type="button" id="player-fullscreen-toggle" class="player-control">全屏</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="player-switch-panel">
+        <div class="player-mode-switch">
+          <a href="#/play/${id}/direct" class="player-btn ${mode === 'direct' ? 'active' : ''}">直刷模式</a>
+          <a href="#/play/${id}/transcode" class="player-btn ${mode === 'transcode' ? 'active' : ''}">转码模式</a>
+        </div>
+        <div id="player-quality-switch" class="player-quality-switch" ${isTranscodeMode ? '' : 'hidden'}>
+          ${TRANSCODE_QUALITY_OPTIONS.map((item) => `
+            <button type="button" class="player-btn player-quality-btn ${item.value === selectedTranscodeQuality ? 'active' : ''}" data-quality="${escapeHtml(item.value)}">${escapeHtml(item.label)}</button>
+          `).join('')}
+        </div>
       </div>
     </div>
   `;
 
-  const PlayerCtor = resolvePlayerCtor(mode);
-  if (!PlayerCtor) {
-    const globalName = mode === 'transcode' ? 'window.HlsPlayer' : 'window.Player';
-    const message = `${globalName} is not loaded.`;
-    console.error(message);
-    renderPlayerError(message);
+  const playerContainer = document.querySelector('.player-container');
+  const shell = document.querySelector('#player-shell');
+  const topbar = document.querySelector('.player-topbar');
+  const controls = document.querySelector('.player-controls');
+  const modeSwitch = document.querySelector('.player-mode-switch');
+  const qualitySwitch = document.querySelector('#player-quality-switch');
+  const video = document.querySelector('#player-video');
+  const playToggle = document.querySelector('#player-play-toggle');
+  const centerToggle = document.querySelector('#player-center-toggle');
+  const muteToggle = document.querySelector('#player-mute-toggle');
+  const progress = document.querySelector('#player-progress');
+  const volume = document.querySelector('#player-volume');
+  const currentTimeEl = document.querySelector('#player-current-time');
+  const durationEl = document.querySelector('#player-duration');
+  const fullscreenToggle = document.querySelector('#player-fullscreen-toggle');
+  const pipToggle = document.querySelector('#player-pip-toggle');
+  const runtimeNote = document.querySelector('#player-runtime-note');
+
+  if (!playerContainer || !shell || !topbar || !controls || !modeSwitch || !qualitySwitch || !video || !playToggle || !centerToggle || !muteToggle || !progress || !volume || !currentTimeEl || !durationEl || !fullscreenToggle || !pipToggle || !runtimeNote) {
+    renderPlayerError('播放器 DOM 初始化不完整，请刷新页面重试。');
     return;
   }
 
-  try {
-    const streamUrl = await buildApiUrl(streamPath);
-    const config = {
-      id: 'xgplayer-el',
-      url: streamUrl,
-      autoplay: true,
-      playsinline: true,
-      fluid: true,
-      width: '100%',
-      height: '100%',
-    };
+  let idleTimer = null;
+  let playbackOffsetSeconds = 0;
+  let knownDurationSeconds = 0;
+  let pendingTranscodeJump = false;
 
-    playerInstance = new PlayerCtor(config);
+  const setRuntimeNote = (message) => {
+    runtimeNote.textContent = message;
+  };
 
-    if (playerInstance?.on) {
-      playerInstance.on('error', (err) => {
-        console.error('XGPlayer runtime error', err);
-        renderPlayerError(err?.message || '播放器运行时发生错误，请检查转码日志和浏览器控制台。');
-      });
+  const currentModeHint = () => {
+    if (!isTranscodeMode) return modeHint;
+    return `${modeHint} 当前清晰度：${getTranscodeQualityLabel(selectedTranscodeQuality)}。`;
+  };
+
+  const syncQualityButtons = () => {
+    qualitySwitch.querySelectorAll('[data-quality]').forEach((button) => {
+      button.classList.toggle('active', button.dataset.quality === selectedTranscodeQuality);
+    });
+  };
+
+  const clampSeekTarget = (seconds) => {
+    const normalized = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+    return knownDurationSeconds > 0 ? Math.min(normalized, knownDurationSeconds) : normalized;
+  };
+
+  const getDisplayCurrentTime = () => {
+    const currentTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    return isTranscodeMode ? clampSeekTarget(playbackOffsetSeconds + currentTime) : currentTime;
+  };
+
+  const getDisplayDuration = () => {
+    if (isTranscodeMode && knownDurationSeconds > 0) {
+      return knownDurationSeconds;
     }
+
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    return isTranscodeMode ? Math.max(duration, playbackOffsetSeconds + duration) : duration;
+  };
+
+  const buildStreamPath = (startTimeSeconds = 0) => {
+    if (isTranscodeMode) {
+      return buildTranscodeStreamPath(id, startTimeSeconds, selectedTranscodeQuality);
+    }
+    return `/api/v1/movies/${id}/direct`;
+  };
+
+  const setPlayerUiVisible = (visible) => {
+    playerContainer.classList.toggle('player-ui-hidden', !visible);
+  };
+
+  const clearUiHideTimer = () => {
+    if (idleTimer !== null) {
+      window.clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+
+  const scheduleUiHide = () => {
+    clearUiHideTimer();
+    if (video.paused || video.ended) {
+      setPlayerUiVisible(true);
+      return;
+    }
+
+    idleTimer = window.setTimeout(() => {
+      if (!video.paused && !video.ended) {
+        setPlayerUiVisible(false);
+      }
+    }, PLAYER_UI_IDLE_MS);
+  };
+
+  const markPlayerInteraction = () => {
+    setPlayerUiVisible(true);
+    scheduleUiHide();
+  };
+
+  const syncControls = () => {
+    const paused = video.paused || video.ended;
+    const duration = getDisplayDuration();
+    const currentTime = getDisplayCurrentTime();
+    const volumeValue = video.muted ? 0 : Math.round((video.volume || 0) * 100);
+
+    playToggle.textContent = paused ? '播放' : '暂停';
+    centerToggle.textContent = paused ? '播放' : '暂停';
+    muteToggle.textContent = video.muted || volumeValue === 0 ? '取消静音' : '静音';
+    fullscreenToggle.textContent = document.fullscreenElement === shell ? '退出全屏' : '全屏';
+    currentTimeEl.textContent = formatPlaybackTime(currentTime);
+    durationEl.textContent = formatPlaybackTime(duration);
+
+    progress.max = duration > 0 ? String(Math.floor(duration * 10)) : '1000';
+    progress.value = duration > 0 ? String(Math.floor(currentTime * 10)) : '0';
+    volume.value = String(volumeValue);
+    setRangeProgress(progress);
+    setRangeProgress(volume);
+
+    if (paused) {
+      clearUiHideTimer();
+      setPlayerUiVisible(true);
+    }
+  };
+
+  const loadPlayerSource = async (startTimeSeconds = 0, runtimeMessage = currentModeHint()) => {
+    const normalizedStartTime = isTranscodeMode ? clampSeekTarget(startTimeSeconds) : 0;
+    if (isTranscodeMode) {
+      playbackOffsetSeconds = normalizedStartTime;
+      pendingTranscodeJump = normalizedStartTime > 0;
+    } else {
+      playbackOffsetSeconds = 0;
+      pendingTranscodeJump = false;
+    }
+
+    const streamUrl = await buildApiUrl(buildStreamPath(normalizedStartTime));
+    video.pause();
+    video.src = streamUrl;
+    video.load();
+    setRuntimeNote(runtimeMessage);
+    syncControls();
+
+    await video.play().catch((err) => {
+      console.warn('Autoplay prevented', err);
+      setRuntimeNote('自动播放被浏览器拦截，请点击播放继续。');
+    });
+  };
+
+  const restartTranscodeAt = async (nextTimeSeconds) => {
+    const target = clampSeekTarget(nextTimeSeconds);
+    await loadPlayerSource(
+      target,
+      `正在以 ${getTranscodeQualityLabel(selectedTranscodeQuality)} 从 ${formatPlaybackTime(target)} 重新建立转码流...`
+    );
+  };
+
+  const togglePlayback = async () => {
+    if (video.paused || video.ended) {
+      try {
+        await video.play();
+      } catch (err) {
+        console.warn('Failed to start playback', err);
+        setRuntimeNote('自动播放被浏览器拦截，请手动点击播放。');
+      }
+    } else {
+      video.pause();
+    }
+  };
+
+  const handleKeydown = async (event) => {
+    const tagName = event.target?.tagName;
+    if (tagName === 'INPUT' || tagName === 'TEXTAREA') return;
+
+    if (event.code === 'Space') {
+      event.preventDefault();
+      await togglePlayback();
+      return;
+    }
+
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      if (isTranscodeMode) {
+        await restartTranscodeAt(getDisplayCurrentTime() - 10);
+      } else {
+        video.currentTime = Math.max(0, video.currentTime - 10);
+      }
+      return;
+    }
+
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      if (isTranscodeMode) {
+        await restartTranscodeAt(getDisplayCurrentTime() + 10);
+      } else {
+        video.currentTime = Math.min(Number.isFinite(video.duration) ? video.duration : video.currentTime + 10, video.currentTime + 10);
+      }
+      return;
+    }
+
+    if (event.key.toLowerCase() === 'm') {
+      event.preventDefault();
+      video.muted = !video.muted;
+      syncControls();
+      return;
+    }
+
+    if (event.key.toLowerCase() === 'f') {
+      event.preventDefault();
+      await toggleFullscreen(shell);
+    }
+  };
+
+  const onPlay = () => {
+    if (isTranscodeMode && playbackOffsetSeconds > 0) {
+      setRuntimeNote(`已从 ${formatPlaybackTime(playbackOffsetSeconds)} 开始继续播放。`);
+    } else {
+      setRuntimeNote(currentModeHint());
+    }
+    syncControls();
+    scheduleUiHide();
+  };
+  const onPause = () => {
+    if (!video.ended) {
+      setRuntimeNote('播放已暂停。');
+    }
+    clearUiHideTimer();
+    setPlayerUiVisible(true);
+    syncControls();
+  };
+  const onWaiting = () => {
+    setRuntimeNote('正在缓冲媒体流...');
+    setPlayerUiVisible(true);
+    scheduleUiHide();
+    syncControls();
+  };
+  const onEnded = () => {
+    setRuntimeNote('播放完成。');
+    clearUiHideTimer();
+    setPlayerUiVisible(true);
+    syncControls();
+  };
+  const onLoadedMetadata = () => {
+    updatePlayerViewportClasses(playerContainer, video);
+    if (pendingTranscodeJump) {
+      setRuntimeNote(`已跳转到 ${formatPlaybackTime(playbackOffsetSeconds)}，继续转码播放。`);
+      pendingTranscodeJump = false;
+    } else {
+      setRuntimeNote(currentModeHint());
+    }
+    syncControls();
+  };
+  const onTimeUpdate = () => syncControls();
+  const onVolumeChange = () => syncControls();
+  const onFullscreenChange = () => {
+    updatePlayerViewportClasses(playerContainer, video);
+    syncControls();
+  };
+  const onError = () => {
+    console.error('Native video playback failed', video.error);
+    clearUiHideTimer();
+    setPlayerUiVisible(true);
+    renderPlayerError('媒体加载失败，请尝试切换播放模式，或检查浏览器格式兼容性与后端转码日志。');
+  };
+  const onViewportChange = () => {
+    updatePlayerViewportClasses(playerContainer, video);
+    markPlayerInteraction();
+  };
+
+  const onShellMouseMove = () => markPlayerInteraction();
+  const onShellTouchStart = () => markPlayerInteraction();
+  const onShellTouchMove = () => markPlayerInteraction();
+  const onShellPointerDown = () => markPlayerInteraction();
+  const onShellFocusIn = () => markPlayerInteraction();
+
+  playToggle.addEventListener('click', togglePlayback);
+  centerToggle.addEventListener('click', togglePlayback);
+  muteToggle.addEventListener('click', () => {
+    video.muted = !video.muted;
+    syncControls();
+  });
+  fullscreenToggle.addEventListener('click', async () => {
+    await toggleFullscreen(shell);
+  });
+  pipToggle.addEventListener('click', async () => {
+    if (!document.pictureInPictureEnabled || video.disablePictureInPicture) {
+      setRuntimeNote('当前浏览器不支持画中画。');
+      return;
+    }
+
+    try {
+      if (document.pictureInPictureElement === video) {
+        await document.exitPictureInPicture();
+      } else {
+        await video.requestPictureInPicture();
+      }
+    } catch (err) {
+      console.warn('Failed to toggle picture-in-picture', err);
+      setRuntimeNote('画中画切换失败，请检查浏览器权限。');
+    }
+  });
+  qualitySwitch.querySelectorAll('[data-quality]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const nextQuality = button.dataset.quality || 'source';
+      if (!isTranscodeMode || nextQuality === selectedTranscodeQuality) return;
+      selectedTranscodeQuality = nextQuality;
+      syncQualityButtons();
+      await restartTranscodeAt(getDisplayCurrentTime());
+    });
+  });
+  progress.addEventListener('input', () => {
+    const nextTime = clampSeekTarget(Number(progress.value) / 10);
+    currentTimeEl.textContent = formatPlaybackTime(nextTime);
+    setRangeProgress(progress);
+  });
+  progress.addEventListener('change', async () => {
+    const nextTime = clampSeekTarget(Number(progress.value) / 10);
+    if (isTranscodeMode) {
+      await restartTranscodeAt(nextTime);
+      return;
+    }
+
+    if (Number.isFinite(video.duration)) {
+      video.currentTime = Number(progress.value) / 10;
+    }
+  });
+  volume.addEventListener('input', () => {
+    const nextVolume = Number(volume.value) / 100;
+    video.volume = nextVolume;
+    video.muted = nextVolume === 0;
+    setRangeProgress(volume);
+    syncControls();
+  });
+  video.addEventListener('click', togglePlayback);
+  video.addEventListener('dblclick', async () => {
+    await toggleFullscreen(shell);
+  });
+  video.addEventListener('play', onPlay);
+  video.addEventListener('pause', onPause);
+  video.addEventListener('waiting', onWaiting);
+  video.addEventListener('ended', onEnded);
+  video.addEventListener('loadedmetadata', onLoadedMetadata);
+  video.addEventListener('timeupdate', onTimeUpdate);
+  video.addEventListener('volumechange', onVolumeChange);
+  video.addEventListener('error', onError);
+  document.addEventListener('fullscreenchange', onFullscreenChange);
+  document.addEventListener('keydown', handleKeydown);
+  window.addEventListener('resize', onViewportChange);
+  window.addEventListener('orientationchange', onViewportChange);
+  shell.addEventListener('mousemove', onShellMouseMove);
+  shell.addEventListener('touchstart', onShellTouchStart, { passive: true });
+  shell.addEventListener('touchmove', onShellTouchMove, { passive: true });
+  shell.addEventListener('pointerdown', onShellPointerDown);
+  shell.addEventListener('focusin', onShellFocusIn);
+
+  if (!document.pictureInPictureEnabled || video.disablePictureInPicture) {
+    pipToggle.hidden = true;
+  }
+
+  playerInstance = {
+    video,
+    pause() {
+      video.pause();
+    },
+    destroy() {
+      clearUiHideTimer();
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+      document.removeEventListener('keydown', handleKeydown);
+      window.removeEventListener('resize', onViewportChange);
+      window.removeEventListener('orientationchange', onViewportChange);
+      shell.removeEventListener('mousemove', onShellMouseMove);
+      shell.removeEventListener('touchstart', onShellTouchStart);
+      shell.removeEventListener('touchmove', onShellTouchMove);
+      shell.removeEventListener('pointerdown', onShellPointerDown);
+      shell.removeEventListener('focusin', onShellFocusIn);
+      video.removeEventListener('click', togglePlayback);
+      video.removeEventListener('dblclick', toggleFullscreen);
+      video.removeEventListener('play', onPlay);
+      video.removeEventListener('pause', onPause);
+      video.removeEventListener('waiting', onWaiting);
+      video.removeEventListener('ended', onEnded);
+      video.removeEventListener('loadedmetadata', onLoadedMetadata);
+      video.removeEventListener('timeupdate', onTimeUpdate);
+      video.removeEventListener('volumechange', onVolumeChange);
+      video.removeEventListener('error', onError);
+      playToggle.removeEventListener('click', togglePlayback);
+      centerToggle.removeEventListener('click', togglePlayback);
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    }
+  };
+
+  updatePlayerViewportClasses(playerContainer, video);
+  syncQualityButtons();
+  syncControls();
+  setPlayerUiVisible(true);
+
+  try {
+    const movie = await moviePromise;
+    const runtimeSeconds = Number(movie?.runtime_seconds);
+    const runtimeMinutes = Number(movie?.runtime_minutes);
+    if (Number.isFinite(runtimeSeconds) && runtimeSeconds > 0) {
+      knownDurationSeconds = runtimeSeconds;
+      syncControls();
+    } else if (Number.isFinite(runtimeMinutes) && runtimeMinutes > 0) {
+      knownDurationSeconds = runtimeMinutes * 60;
+      syncControls();
+    }
+
+    await loadPlayerSource(0, currentModeHint());
   } catch (err) {
-    console.error('Failed to initialize XGPlayer', err);
+    console.error('Failed to initialize native player', err);
     renderPlayerError(err?.message || '播放器初始化失败，请检查浏览器控制台。');
   }
 }

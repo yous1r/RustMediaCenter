@@ -91,11 +91,19 @@ mod tests {
         // 3. 再次加载，确保读取修改后的配置
         let loaded = ServerConfig::load_from(&config_path).unwrap();
         assert_eq!(loaded.port, 9000);
-        assert_eq!(loaded.media_dirs, vec!["/media1".to_string(), "/media2".to_string()]);
+        assert_eq!(
+            loaded.media_dirs,
+            vec!["/media1".to_string(), "/media2".to_string()]
+        );
         assert_eq!(loaded.db_path, "rmc_test.db".to_string());
         assert_eq!(loaded.tmdb_api_key, Some("test_api_key".to_string()));
-        assert_eq!(loaded.tmdb_proxy_url, Some("http://proxy.example.com".to_string()));
-        assert_eq!(loaded.tmdb_api_base, Some("https://api.example.com".to_string()));
+        assert_eq!(
+            loaded.tmdb_proxy_url,
+            Some("http://proxy.example.com".to_string())
+        );
+        assert_eq!(
+            loaded.tmdb_api_base,
+            Some("https://api.example.com".to_string())
+        );
     }
 }
-

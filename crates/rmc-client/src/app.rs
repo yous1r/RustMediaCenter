@@ -1,5 +1,5 @@
-use iced::{Task, Element};
-use iced::widget::{text, column, scrollable, container};
+use iced::widget::{column, container, scrollable, text};
+use iced::{Element, Task};
 use rmc_core::models::Movie;
 
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:19000";
@@ -82,7 +82,10 @@ impl RmcApp {
         let mut col = column![].spacing(10);
         for movie in &self.movies {
             let title = movie.title.clone();
-            let year_str = movie.year.map(|y| y.to_string()).unwrap_or_else(|| "Unknown".to_string());
+            let year_str = movie
+                .year
+                .map(|y| y.to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
             col = col.push(text(format!("{} ({})", title, year_str)));
         }
 
@@ -99,7 +102,7 @@ mod tests {
         let (app, _) = RmcApp::new();
         assert_eq!(app.movies.len(), 0);
     }
-    
+
     #[test]
     fn test_update_movies_message() {
         let (mut app, _) = RmcApp::new();
@@ -112,10 +115,11 @@ mod tests {
             overview: None,
             tmdb_id: None,
             runtime_minutes: None,
+            runtime_seconds: None,
             added_at: 0,
             file_size: None,
         }];
-        
+
         let _ = app.update(Message::MoviesLoaded(Ok(test_movies)));
         assert_eq!(app.movies.len(), 1);
         assert_eq!(app.movies[0].title, "Test Movie");

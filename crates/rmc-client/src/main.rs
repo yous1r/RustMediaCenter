@@ -1,5 +1,5 @@
-mod app;
 mod api_client;
+mod app;
 mod player;
 pub mod views;
 

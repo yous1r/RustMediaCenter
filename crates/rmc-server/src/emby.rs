@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use rmc_core::api_types::{LibraryItem, LibraryItemKind};
 use rmc_core::models::Movie;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -14,10 +15,14 @@ use crate::api::AppState;
 use crate::auth::Claims;
 use crate::db::Database;
 use crate::error::AppError;
+use crate::media_tree::{MediaTree, ROOT_COLLECTION_ID};
 
 const SERVER_ID: &str = "rust-media-center";
 const VIRTUAL_USER_ID: &str = "1";
 const DEFAULT_SERVER_NAME: &str = "RustMediaCenter";
+const MOVIES_VIEW_ID: &str = "movies";
+const TVSHOWS_VIEW_ID: &str = "tvshows";
+const MAX_RUNTIME_PROBE_ITEMS_PER_IDS_QUERY: usize = 8;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -222,38 +227,50 @@ fn movie_container(movie: &Movie) -> Option<String> {
 
 fn runtime_ticks(movie: &Movie) -> Option<u64> {
     movie
-        .runtime_minutes
-        .map(|minutes| minutes as u64 * 60 * 10_000_000)
+        .runtime_seconds
+        .map(|seconds| seconds as u64 * 10_000_000)
+        .or_else(|| {
+            movie
+                .runtime_minutes
+                .map(|minutes| minutes as u64 * 60 * 10_000_000)
+        })
 }
 
-fn build_media_source(movie: &Movie, headers: &HeaderMap, prefix: &str, token: &str) -> Value {
+fn library_item_runtime_ticks(item: &LibraryItem) -> Option<u64> {
+    item.runtime_seconds
+        .map(|seconds| seconds as u64 * 10_000_000)
+        .or_else(|| {
+            item.runtime_minutes
+                .map(|minutes| minutes as u64 * 60 * 10_000_000)
+        })
+}
+
+fn build_media_source(
+    item: &LibraryItem,
+    movie: &Movie,
+    headers: &HeaderMap,
+    prefix: &str,
+    token: &str,
+) -> Value {
     let direct_url = with_api_key(
-        absolute_url(
-            headers,
-            prefix,
-            &format!("/Videos/{}/original", movie.id),
-        ),
+        absolute_url(headers, prefix, &format!("/Videos/{}/original", item.id)),
         token,
     );
     let transcode_url = with_api_key(
-        absolute_url(
-            headers,
-            prefix,
-            &format!("/Videos/{}/stream.mp4", movie.id),
-        ),
+        absolute_url(headers, prefix, &format!("/Videos/{}/stream.mp4", item.id)),
         token,
     );
 
     json!({
-        "Id": format!("movie-{}", movie.id),
-        "ItemId": movie.id.to_string(),
-        "Name": movie.title,
+        "Id": format!("item-{}", item.id.replace(':', "-")),
+        "ItemId": item.id,
+        "Name": item.title,
         "Type": "Default",
         "Protocol": "Http",
         "Path": direct_url,
         "Container": movie_container(movie),
-        "Size": movie.file_size,
-        "RunTimeTicks": runtime_ticks(movie),
+        "Size": item.file_size.or(movie.file_size),
+        "RunTimeTicks": library_item_runtime_ticks(item).or_else(|| runtime_ticks(movie)),
         "IsRemote": movie.file_path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("strm")).unwrap_or(false),
         "SupportsDirectPlay": true,
         "SupportsDirectStream": true,
@@ -267,12 +284,103 @@ fn build_media_source(movie: &Movie, headers: &HeaderMap, prefix: &str, token: &
     })
 }
 
-fn build_movie_item(movie: &Movie, headers: &HeaderMap, prefix: &str, token: Option<&str>) -> Value {
-    let image_url = movie.poster_url.as_ref().map(|_| {
+fn emby_item_type(kind: &LibraryItemKind) -> &'static str {
+    match kind {
+        LibraryItemKind::Movie => "Movie",
+        LibraryItemKind::Series => "Series",
+        LibraryItemKind::Season => "Season",
+        LibraryItemKind::Episode => "Episode",
+    }
+}
+
+fn emby_collection_type(kind: &LibraryItemKind) -> Option<&'static str> {
+    match kind {
+        LibraryItemKind::Movie => Some("movies"),
+        LibraryItemKind::Series => Some("tvshows"),
+        LibraryItemKind::Season | LibraryItemKind::Episode => None,
+    }
+}
+
+fn is_folder_item(kind: &LibraryItemKind) -> bool {
+    matches!(kind, LibraryItemKind::Series | LibraryItemKind::Season)
+}
+
+fn is_virtual_view_id(id: &str) -> bool {
+    matches!(id, MOVIES_VIEW_ID | TVSHOWS_VIEW_ID)
+}
+
+fn virtual_view_item(id: &str, child_count: usize) -> Option<Value> {
+    match id {
+        MOVIES_VIEW_ID => Some(json!({
+            "Name": "Movies",
+            "ServerId": SERVER_ID,
+            "Id": MOVIES_VIEW_ID,
+            "Type": "CollectionFolder",
+            "CollectionType": "movies",
+            "MediaType": "Video",
+            "IsFolder": true,
+            "ChildCount": child_count,
+            "RecursiveItemCount": child_count,
+            "ImageTags": {}
+        })),
+        TVSHOWS_VIEW_ID => Some(json!({
+            "Name": "TV Shows",
+            "ServerId": SERVER_ID,
+            "Id": TVSHOWS_VIEW_ID,
+            "Type": "CollectionFolder",
+            "CollectionType": "tvshows",
+            "MediaType": "Video",
+            "IsFolder": true,
+            "ChildCount": child_count,
+            "RecursiveItemCount": child_count,
+            "ImageTags": {}
+        })),
+        _ => None,
+    }
+}
+
+fn virtual_view_items(tree: &MediaTree) -> Vec<Value> {
+    let root_items = tree.paged_items(None, None, 0, None).items;
+    let movie_count = root_items
+        .iter()
+        .filter(|item| matches!(item.kind, LibraryItemKind::Movie))
+        .count();
+    let series_count = root_items
+        .iter()
+        .filter(|item| matches!(item.kind, LibraryItemKind::Series))
+        .count();
+
+    vec![
+        virtual_view_item(MOVIES_VIEW_ID, movie_count).unwrap(),
+        virtual_view_item(TVSHOWS_VIEW_ID, series_count).unwrap(),
+    ]
+}
+
+fn filter_items_for_parent(items: Vec<LibraryItem>, parent_id: Option<&str>) -> Vec<LibraryItem> {
+    match parent_id.map(str::trim) {
+        Some(MOVIES_VIEW_ID) => items
+            .into_iter()
+            .filter(|item| matches!(item.kind, LibraryItemKind::Movie))
+            .collect(),
+        Some(TVSHOWS_VIEW_ID) => items
+            .into_iter()
+            .filter(|item| matches!(item.kind, LibraryItemKind::Series))
+            .collect(),
+        _ => items,
+    }
+}
+
+fn build_library_item(
+    item: &LibraryItem,
+    headers: &HeaderMap,
+    prefix: &str,
+    token: Option<&str>,
+) -> Value {
+    let image_url = item.poster_url.as_ref().map(|_| {
         let url = absolute_url(
             headers,
             prefix,
-            &format!("/Items/{}/Images/Primary", movie.id),
+            &format!("/Items/{}/Images/Primary", item.id),
         );
         match token {
             Some(value) => with_api_key(url, value),
@@ -281,24 +389,28 @@ fn build_movie_item(movie: &Movie, headers: &HeaderMap, prefix: &str, token: Opt
     });
 
     json!({
-        "Name": movie.title,
+        "Name": item.title,
         "ServerId": SERVER_ID,
-        "Id": movie.id.to_string(),
-        "Type": "Movie",
+        "Id": item.id,
+        "Type": emby_item_type(&item.kind),
         "MediaType": "Video",
-        "CollectionType": "movies",
-        "Overview": movie.overview,
-        "ProductionYear": movie.year,
-        "RunTimeTicks": runtime_ticks(movie),
-        "ImageTags": movie.poster_url.as_ref().map(|_| json!({ "Primary": format!("poster-{}", movie.id) })).unwrap_or_else(|| json!({})),
+        "CollectionType": emby_collection_type(&item.kind),
+        "Overview": item.overview,
+        "ProductionYear": item.year,
+        "RunTimeTicks": library_item_runtime_ticks(item),
+        "ImageTags": item.poster_url.as_ref().map(|_| json!({ "Primary": format!("poster-{}", item.id.replace(':', "-")) })).unwrap_or_else(|| json!({})),
         "ImageBlurHashes": {},
         "PrimaryImageAspectRatio": serde_json::Value::Null,
-        "PrimaryImageItemId": movie.poster_url.as_ref().map(|_| movie.id.to_string()),
+        "PrimaryImageItemId": item.poster_url.as_ref().map(|_| item.id.clone()),
         "ImagePath": image_url,
-        "CanDownload": true,
-        "RecursiveItemCount": 0,
-        "IsFolder": false,
-        "Container": movie_container(movie),
+        "CanDownload": item.play_id.is_some(),
+        "RecursiveItemCount": item.child_count,
+        "ChildCount": item.child_count,
+        "IsFolder": is_folder_item(&item.kind),
+        "Container": serde_json::Value::Null,
+        "ParentId": item.parent_id,
+        "IndexNumber": item.episode_number.or(item.season_number),
+        "ParentIndexNumber": if matches!(item.kind, LibraryItemKind::Episode) { item.season_number } else { None },
         "UserData": {
             "PlaybackPositionTicks": 0,
             "PlayCount": 0,
@@ -308,60 +420,184 @@ fn build_movie_item(movie: &Movie, headers: &HeaderMap, prefix: &str, token: Opt
     })
 }
 
-fn parse_item_ids(raw: &str) -> Vec<i64> {
+fn parse_item_ids(raw: &str) -> Vec<String> {
     raw.split(',')
-        .filter_map(|value| value.trim().parse::<i64>().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
         .collect()
 }
 
-fn sort_movies(movies: &mut [Movie], sort_by: Option<&str>, sort_order: Option<&str>) {
+fn matches_search_term(item: &LibraryItem, search_term: &str) -> bool {
+    let normalized = search_term.trim().to_ascii_lowercase();
+    item.title.to_ascii_lowercase().contains(&normalized)
+        || item
+            .overview
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains(&normalized)
+}
+
+fn sort_library_items(items: &mut [LibraryItem], sort_by: Option<&str>, sort_order: Option<&str>) {
     let descending = sort_order
         .map(|value| value.eq_ignore_ascii_case("descending"))
         .unwrap_or(false);
 
-    if sort_by
-        .map(|value| value.eq_ignore_ascii_case("DateCreated") || value.eq_ignore_ascii_case("DateAdded"))
-        .unwrap_or(false)
-    {
-        movies.sort_by_key(|movie| movie.added_at);
-    } else {
-        movies.sort_by(|a, b| a.title.cmp(&b.title));
+    match sort_by {
+        Some(value)
+            if value.eq_ignore_ascii_case("DateCreated")
+                || value.eq_ignore_ascii_case("DateAdded") =>
+        {
+            items.sort_by_key(|item| item.added_at);
+        }
+        Some(_) => {
+            items.sort_by(|a, b| {
+                a.title
+                    .to_ascii_lowercase()
+                    .cmp(&b.title.to_ascii_lowercase())
+            });
+        }
+        None => {}
     }
 
     if descending {
-        movies.reverse();
+        items.reverse();
     }
 }
 
-async fn load_movies(db: &Database, query: &ItemsQuery) -> Result<Vec<Movie>, AppError> {
-    let mut movies = if let Some(search_term) = query.search_term.as_deref().filter(|value| !value.trim().is_empty()) {
-        db.search_movies(search_term)
-            .await
-            .map_err(|err| AppError::Internal(err.into()))?
+fn normalize_parent_id(parent_id: Option<&str>) -> Option<&str> {
+    let parent_id = parent_id?.trim();
+    if parent_id.is_empty()
+        || is_virtual_view_id(parent_id)
+        || parent_id == ROOT_COLLECTION_ID
+        || parent_id == VIRTUAL_USER_ID
+    {
+        None
     } else {
-        db.get_movies()
-            .await
-            .map_err(|err| AppError::Internal(err.into()))?
-    };
+        Some(parent_id)
+    }
+}
 
-    if let Some(ids) = query.ids.as_deref().filter(|value| !value.trim().is_empty()) {
-        let ids = parse_item_ids(ids);
-        movies.retain(|movie| ids.contains(&movie.id));
+async fn load_media_tree(db: &Database) -> Result<MediaTree, AppError> {
+    let movies = db
+        .get_available_movies()
+        .await
+        .map_err(|err| AppError::Internal(err.into()))?;
+    Ok(MediaTree::from_movies(movies))
+}
+
+async fn backfill_runtime_for_items(
+    db: &Database,
+    items: Vec<LibraryItem>,
+) -> Result<Vec<LibraryItem>, AppError> {
+    let mut hydrated = Vec::with_capacity(items.len());
+
+    for mut item in items {
+        if let Some(play_id) = item.play_id.filter(|_| item.runtime_seconds.is_none()) {
+            let movie = crate::media_probe::load_movie_with_runtime(db, play_id)
+                .await
+                .map_err(|err| AppError::Internal(err))?;
+            item.runtime_seconds = movie.runtime_seconds;
+            item.runtime_minutes = movie.runtime_minutes;
+        }
+        hydrated.push(item);
     }
 
-    if let Some(parent_id) = query.parent_id.as_deref().filter(|value| !value.trim().is_empty()) {
-        let is_library_root = parent_id == "movies" || parent_id == VIRTUAL_USER_ID;
-        if !is_library_root {
-            if let Ok(parent_movie_id) = parent_id.parse::<i64>() {
-                movies.retain(|movie| movie.id == parent_movie_id);
-            } else {
-                movies.clear();
-            }
+    Ok(hydrated)
+}
+
+async fn load_library_items(
+    db: &Database,
+    query: &ItemsQuery,
+) -> Result<Vec<LibraryItem>, AppError> {
+    let tree = load_media_tree(db).await?;
+    let parent_id = query.parent_id.as_deref().map(str::trim);
+    let mut items = if let Some(ids) = query
+        .ids
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let requested_ids = parse_item_ids(ids);
+        let should_probe_runtime = requested_ids.len() <= MAX_RUNTIME_PROBE_ITEMS_PER_IDS_QUERY;
+        let items = requested_ids
+            .into_iter()
+            .filter(|id| !is_virtual_view_id(id))
+            .filter_map(|id| tree.item(&id))
+            .collect::<Vec<_>>();
+        if should_probe_runtime {
+            backfill_runtime_for_items(db, items).await?
+        } else {
+            items
+        }
+    } else {
+        tree.paged_items(
+            normalize_parent_id(parent_id),
+            query.search_term.as_deref(),
+            0,
+            None,
+        )
+        .items
+    };
+
+    items = filter_items_for_parent(items, parent_id);
+
+    if let Some(search_term) = query
+        .search_term
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if query.ids.is_some() {
+            items.retain(|item| matches_search_term(item, search_term));
         }
     }
 
-    sort_movies(&mut movies, query.sort_by.as_deref(), query.sort_order.as_deref());
-    Ok(movies)
+    sort_library_items(
+        &mut items,
+        query.sort_by.as_deref(),
+        query.sort_order.as_deref(),
+    );
+    Ok(items)
+}
+
+async fn get_library_item(db: &Database, id: &str) -> Result<LibraryItem, AppError> {
+    let tree = load_media_tree(db).await?;
+    tree.item(id)
+        .ok_or_else(|| AppError::NotFound(format!("Item {} not found", id)))
+}
+
+async fn get_virtual_view_detail(db: &Database, id: &str) -> Result<Value, AppError> {
+    let tree = load_media_tree(db).await?;
+    virtual_view_items(&tree)
+        .into_iter()
+        .find(|item| item["Id"].as_str() == Some(id))
+        .ok_or_else(|| AppError::NotFound(format!("Item {} not found", id)))
+}
+
+async fn get_playable_item_and_movie(
+    db: &Database,
+    id: &str,
+) -> Result<(LibraryItem, Movie), AppError> {
+    let item = get_library_item(db, id).await?;
+    let play_id = item
+        .play_id
+        .ok_or_else(|| AppError::NotFound(format!("Item {} is not playable", id)))?;
+    let movie = crate::media_probe::load_movie_with_runtime(db, play_id)
+        .await
+        .map_err(|err| match err.downcast::<sqlx::Error>() {
+            Ok(sqlx::Error::RowNotFound) => {
+                AppError::NotFound(format!("Movie id {} not found", play_id))
+            }
+            Ok(other) => AppError::Internal(other.into()),
+            Err(other) => AppError::Internal(other),
+        })?;
+    Ok((item, movie))
+}
+
+async fn get_playable_movie_id(db: &Database, id: &str) -> Result<i64, AppError> {
+    let (item, _) = get_playable_item_and_movie(db, id).await?;
+    item.play_id
+        .ok_or_else(|| AppError::NotFound(format!("Item {} is not playable", id)))
 }
 
 fn paged_items_response(items: Vec<Value>, total: usize, start_index: usize) -> Value {
@@ -372,16 +608,7 @@ fn paged_items_response(items: Vec<Value>, total: usize, start_index: usize) -> 
     })
 }
 
-async fn get_movie(db: &Database, id: i64) -> Result<Movie, AppError> {
-    db.get_movie_by_id(id).await.map_err(|err| match err {
-        sqlx::Error::RowNotFound => AppError::NotFound(format!("Movie id {} not found", id)),
-        _ => AppError::Internal(err.into()),
-    })
-}
-
-async fn system_info_public(
-    headers: HeaderMap,
-) -> Result<Json<Value>, AppError> {
+async fn system_info_public(headers: HeaderMap) -> Result<Json<Value>, AppError> {
     Ok(Json(json!({
         "ServerName": server_name(),
         "Version": env!("CARGO_PKG_VERSION"),
@@ -425,8 +652,8 @@ async fn authenticate_by_name(
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
     }
 
-    let access_token = crate::auth::create_jwt(&username)
-        .map_err(|err| AppError::Internal(err.into()))?;
+    let access_token =
+        crate::auth::create_jwt(&username).map_err(|err| AppError::Internal(err.into()))?;
     let session_id = format!("session-{}-{}", username, Utc::now().timestamp_millis());
 
     Ok(Json(json!({
@@ -467,23 +694,12 @@ async fn user_views(
     Path(_user_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let _auth = require_auth(&headers, query.api_key.as_deref())?;
-    let count = db
-        .get_movie_count()
-        .await
-        .map_err(|err| AppError::Internal(err.into()))?;
+    let tree = load_media_tree(&db).await?;
+    let items = virtual_view_items(&tree);
 
     Ok(Json(json!({
-        "Items": [{
-            "Name": "Movies",
-            "ServerId": SERVER_ID,
-            "Id": "movies",
-            "Type": "CollectionFolder",
-            "CollectionType": "movies",
-            "IsFolder": true,
-            "ChildCount": count,
-            "ImageTags": {}
-        }],
-        "TotalRecordCount": 1,
+        "Items": items,
+        "TotalRecordCount": 2,
         "StartIndex": 0
     })))
 }
@@ -497,15 +713,15 @@ async fn user_items(
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&headers, query.api_key.as_deref())?;
     let prefix = route_prefix(&original_uri.0);
-    let movies = load_movies(&db, &query).await?;
-    let total = movies.len();
+    let items = load_library_items(&db, &query).await?;
+    let total = items.len();
     let start_index = query.start_index.unwrap_or(0).min(total);
     let limit = query.limit.unwrap_or(total.saturating_sub(start_index));
-    let items = movies
+    let items = items
         .into_iter()
         .skip(start_index)
         .take(limit)
-        .map(|movie| build_movie_item(&movie, &headers, prefix, Some(&auth.token)))
+        .map(|item| build_library_item(&item, &headers, prefix, Some(&auth.token)))
         .collect::<Vec<_>>();
 
     Ok(Json(paged_items_response(items, total, start_index)))
@@ -520,17 +736,12 @@ async fn latest_items(
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&headers, query.api_key.as_deref())?;
     let prefix = route_prefix(&original_uri.0);
-    let mut movies = db
-        .get_movies()
-        .await
-        .map_err(|err| AppError::Internal(err.into()))?;
-    movies.sort_by_key(|movie| movie.added_at);
-    movies.reverse();
-
-    let items = movies
+    let items = load_media_tree(&db)
+        .await?
+        .playable_items_sorted_by_added_at()
         .into_iter()
         .take(50)
-        .map(|movie| build_movie_item(&movie, &headers, prefix, Some(&auth.token)))
+        .map(|item| build_library_item(&item, &headers, prefix, Some(&auth.token)))
         .collect::<Vec<_>>();
 
     Ok(Json(Value::Array(items)))
@@ -544,15 +755,15 @@ async fn items(
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&headers, query.api_key.as_deref())?;
     let prefix = route_prefix(&original_uri.0);
-    let movies = load_movies(&db, &query).await?;
-    let total = movies.len();
+    let items = load_library_items(&db, &query).await?;
+    let total = items.len();
     let start_index = query.start_index.unwrap_or(0).min(total);
     let limit = query.limit.unwrap_or(total.saturating_sub(start_index));
-    let items = movies
+    let items = items
         .into_iter()
         .skip(start_index)
         .take(limit)
-        .map(|movie| build_movie_item(&movie, &headers, prefix, Some(&auth.token)))
+        .map(|item| build_library_item(&item, &headers, prefix, Some(&auth.token)))
         .collect::<Vec<_>>();
 
     Ok(Json(paged_items_response(items, total, start_index)))
@@ -566,14 +777,27 @@ async fn item_detail(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&headers, query.api_key.as_deref())?;
-    let movie_id = id
-        .parse::<i64>()
-        .map_err(|_| AppError::NotFound(format!("Invalid movie id {}", id)))?;
-    let movie = get_movie(&db, movie_id).await?;
+    if is_virtual_view_id(&id) {
+        return Ok(Json(get_virtual_view_detail(&db, &id).await?));
+    }
+
+    let item = get_library_item(&db, &id).await?;
     let prefix = route_prefix(&original_uri.0);
-    let mut item = build_movie_item(&movie, &headers, prefix, Some(&auth.token));
-    item["MediaSources"] = json!([build_media_source(&movie, &headers, prefix, &auth.token)]);
-    Ok(Json(item))
+    let mut response = build_library_item(&item, &headers, prefix, Some(&auth.token));
+
+    if item.play_id.is_some() {
+        let (_, movie) = get_playable_item_and_movie(&db, &id).await?;
+        response["RunTimeTicks"] = json!(runtime_ticks(&movie));
+        response["MediaSources"] = json!([build_media_source(
+            &item,
+            &movie,
+            &headers,
+            prefix,
+            &auth.token,
+        )]);
+    }
+
+    Ok(Json(response))
 }
 
 async fn user_item_detail(
@@ -583,7 +807,14 @@ async fn user_item_detail(
     State(db): State<AppState>,
     Path((_user_id, item_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    item_detail(headers, original_uri, Query(query), State(db), Path(item_id)).await
+    item_detail(
+        headers,
+        original_uri,
+        Query(query),
+        State(db),
+        Path(item_id),
+    )
+    .await
 }
 
 async fn primary_image(
@@ -593,13 +824,10 @@ async fn primary_image(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let _auth = require_auth(&headers, query.api_key.as_deref())?;
-    let movie_id = id
-        .parse::<i64>()
-        .map_err(|_| AppError::NotFound(format!("Invalid movie id {}", id)))?;
-    let movie = get_movie(&db, movie_id).await?;
-    let poster_url = movie
+    let item = get_library_item(&db, &id).await?;
+    let poster_url = item
         .poster_url
-        .ok_or_else(|| AppError::NotFound(format!("Movie id {} has no poster", movie_id)))?;
+        .ok_or_else(|| AppError::NotFound(format!("Item {} has no poster", id)))?;
     Ok(Redirect::temporary(&poster_url))
 }
 
@@ -611,16 +839,13 @@ async fn playback_info(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let auth = require_auth(&headers, query.api_key.as_deref())?;
-    let movie_id = id
-        .parse::<i64>()
-        .map_err(|_| AppError::NotFound(format!("Invalid movie id {}", id)))?;
-    let movie = get_movie(&db, movie_id).await?;
+    let (item, movie) = get_playable_item_and_movie(&db, &id).await?;
     let prefix = route_prefix(&original_uri.0);
     let play_session_id = format!("play-{}-{}", movie.id, Utc::now().timestamp_millis());
 
     Ok(Json(json!({
         "PlaySessionId": play_session_id,
-        "MediaSources": [build_media_source(&movie, &headers, prefix, &auth.token)]
+        "MediaSources": [build_media_source(&item, &movie, &headers, prefix, &auth.token)]
     })))
 }
 
@@ -635,37 +860,45 @@ fn redirect_to_api_path(path: &str) -> Result<Response, AppError> {
 async fn video_original(
     headers: HeaderMap,
     Query(query): Query<ApiKeyQuery>,
+    State(db): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
     let _auth = require_auth(&headers, query.api_key.as_deref())?;
-    redirect_to_api_path(&format!("/api/v1/movies/{}/direct", id))
+    let movie_id = get_playable_movie_id(&db, &id).await?;
+    redirect_to_api_path(&format!("/api/v1/movies/{}/direct", movie_id))
 }
 
 async fn video_stream(
     headers: HeaderMap,
     Query(query): Query<ApiKeyQuery>,
+    State(db): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
     let _auth = require_auth(&headers, query.api_key.as_deref())?;
-    redirect_to_api_path(&format!("/api/v1/movies/{}/direct", id))
+    let movie_id = get_playable_movie_id(&db, &id).await?;
+    redirect_to_api_path(&format!("/api/v1/movies/{}/direct", movie_id))
 }
 
 async fn video_stream_mp4(
     headers: HeaderMap,
     Query(query): Query<ApiKeyQuery>,
+    State(db): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
     let _auth = require_auth(&headers, query.api_key.as_deref())?;
-    redirect_to_api_path(&format!("/api/v1/movies/{}/stream.mp4", id))
+    let movie_id = get_playable_movie_id(&db, &id).await?;
+    redirect_to_api_path(&format!("/api/v1/movies/{}/stream.mp4", movie_id))
 }
 
 async fn video_hls_playlist(
     headers: HeaderMap,
     Query(query): Query<ApiKeyQuery>,
+    State(db): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
     let _auth = require_auth(&headers, query.api_key.as_deref())?;
-    redirect_to_api_path(&format!("/api/v1/movies/{}/hls/master.m3u8", id))
+    let movie_id = get_playable_movie_id(&db, &id).await?;
+    redirect_to_api_path(&format!("/api/v1/movies/{}/hls/master.m3u8", movie_id))
 }
 
 async fn report_playing(
@@ -702,6 +935,7 @@ async fn report_playing_stopped(
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use tower::ServiceExt;
 
@@ -714,7 +948,24 @@ mod tests {
 
     impl EnvGuard {
         fn set(entries: &[(&'static str, &'static str)]) -> Self {
-            let lock = ENV_MUTEX.lock().unwrap();
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut previous = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                previous.push((*key, std::env::var(key).ok()));
+                std::env::set_var(key, value);
+            }
+            Self {
+                _lock: lock,
+                entries: previous,
+            }
+        }
+
+        fn set_owned(entries: &[(&'static str, String)]) -> Self {
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut previous = Vec::with_capacity(entries.len());
             for (key, value) in entries {
                 previous.push((*key, std::env::var(key).ok()));
@@ -740,19 +991,69 @@ mod tests {
     }
 
     async fn build_app() -> axum::Router {
+        let temp_root = tempfile::tempdir().unwrap().keep();
+        let movie_path = temp_root.join("movies").join("blade-runner-2049.mkv");
+        let episode_one_path = temp_root
+            .join("shows")
+            .join("Tiny World")
+            .join("Season 1")
+            .join("Tiny.World.S01E01.mkv");
+        let episode_two_path = temp_root
+            .join("shows")
+            .join("Tiny World")
+            .join("Season 1")
+            .join("Tiny.World.S01E02.mkv");
+
+        std::fs::create_dir_all(movie_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(episode_one_path.parent().unwrap()).unwrap();
+        std::fs::write(&movie_path, b"movie").unwrap();
+        std::fs::write(&episode_one_path, b"episode-one").unwrap();
+        std::fs::write(&episode_two_path, b"episode-two").unwrap();
+
         let db = Database::new("sqlite::memory:").await.unwrap();
         db.init_schema().await.unwrap();
         db.insert_movie(&Movie {
             id: 1,
             title: "Blade Runner 2049".to_string(),
             year: Some(2017),
-            file_path: std::path::PathBuf::from("/movies/blade-runner-2049.mkv"),
+            file_path: movie_path,
             poster_url: Some("https://example.com/poster.jpg".to_string()),
             overview: Some("Officer K uncovers a secret.".to_string()),
             tmdb_id: Some(335984),
             runtime_minutes: Some(164),
+            runtime_seconds: Some(9_840),
             added_at: 1_717_896_000,
             file_size: Some(4_000_000_000),
+        })
+        .await
+        .unwrap();
+        db.insert_movie(&Movie {
+            id: 2,
+            title: "Tiny World".to_string(),
+            year: Some(2020),
+            file_path: episode_one_path,
+            poster_url: Some("https://example.com/tiny-world.jpg".to_string()),
+            overview: Some("Nature documentary episode one.".to_string()),
+            tmdb_id: None,
+            runtime_minutes: Some(30),
+            runtime_seconds: Some(1_800),
+            added_at: 1_717_896_100,
+            file_size: Some(1_000_000_000),
+        })
+        .await
+        .unwrap();
+        db.insert_movie(&Movie {
+            id: 3,
+            title: "Tiny World".to_string(),
+            year: Some(2020),
+            file_path: episode_two_path,
+            poster_url: Some("https://example.com/tiny-world.jpg".to_string()),
+            overview: Some("Nature documentary episode two.".to_string()),
+            tmdb_id: None,
+            runtime_minutes: Some(31),
+            runtime_seconds: Some(1_860),
+            added_at: 1_717_896_200,
+            file_size: Some(1_100_000_000),
         })
         .await
         .unwrap();
@@ -779,13 +1080,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 200);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         value
             .get("AccessToken")
             .and_then(Value::as_str)
             .unwrap()
             .to_string()
+    }
+
+    fn write_fake_ffprobe(temp_dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let script_path = temp_dir.path().join("fake_ffprobe.sh");
+        let script = r#"#!/bin/sh
+printf '{"format":{"duration":"187.4"}}\n'
+"#;
+        std::fs::write(&script_path, script).unwrap();
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+        script_path
     }
 
     #[tokio::test]
@@ -803,10 +1118,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 200);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value.get("ProductName").and_then(Value::as_str), Some("Emby"));
-        assert_eq!(value.get("LocalAddress").and_then(Value::as_str), Some("http://media.test"));
+        assert_eq!(
+            value.get("ProductName").and_then(Value::as_str),
+            Some("Emby")
+        );
+        assert_eq!(
+            value.get("LocalAddress").and_then(Value::as_str),
+            Some("http://media.test")
+        );
     }
 
     #[tokio::test]
@@ -823,7 +1146,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/Users/{}/Views?api_key={}", VIRTUAL_USER_ID, token))
+                    .uri(format!(
+                        "/Users/{}/Views?api_key={}",
+                        VIRTUAL_USER_ID, token
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -831,10 +1157,32 @@ mod tests {
             .unwrap();
         assert_eq!(views_response.status(), 200);
 
+        let views_body = axum::body::to_bytes(views_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let views_value: Value = serde_json::from_slice(&views_body).unwrap();
+        assert_eq!(views_value["TotalRecordCount"].as_u64(), Some(2));
+        assert!(views_value["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["Id"].as_str() == Some(MOVIES_VIEW_ID)
+                && item["CollectionType"].as_str() == Some("movies")));
+        assert!(views_value["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["Id"].as_str() == Some(TVSHOWS_VIEW_ID)
+                && item["CollectionType"].as_str() == Some("tvshows")));
+
         let items_response = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/Items?ParentId=movies&api_key={}", token))
+                    .uri(format!(
+                        "/Items?ParentId={}&api_key={}",
+                        MOVIES_VIEW_ID, token
+                    ))
                     .header("host", "media.test")
                     .body(Body::empty())
                     .unwrap(),
@@ -843,11 +1191,163 @@ mod tests {
             .unwrap();
         assert_eq!(items_response.status(), 200);
 
-        let body = axum::body::to_bytes(items_response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(items_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value.get("TotalRecordCount").and_then(Value::as_u64), Some(1));
-        assert_eq!(value["Items"][0]["Name"].as_str(), Some("Blade Runner 2049"));
-        assert!(value["Items"][0]["ImagePath"].as_str().unwrap().contains("/Items/1/Images/Primary"));
+        assert_eq!(
+            value.get("TotalRecordCount").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(value["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["Name"].as_str() == Some("Blade Runner 2049")));
+
+        let tv_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?ParentId={}&api_key={}",
+                        TVSHOWS_VIEW_ID, token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tv_response.status(), 200);
+
+        let tv_body = axum::body::to_bytes(tv_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tv_value: Value = serde_json::from_slice(&tv_body).unwrap();
+        assert_eq!(
+            tv_value.get("TotalRecordCount").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(tv_value["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["Name"].as_str() == Some("Tiny World")
+                && item["Type"].as_str() == Some("Series")));
+    }
+
+    #[tokio::test]
+    async fn test_emby_items_follow_series_season_episode_hierarchy() {
+        let _guard = EnvGuard::set(&[
+            ("RMC_ADMIN_USERNAME", "admin"),
+            ("RMC_ADMIN_PASSWORD", "admin"),
+            ("RMC_JWT_SECRET", "emby-test-secret"),
+        ]);
+        let app = build_app().await;
+        let token = emby_login(app.clone()).await;
+
+        let root_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?ParentId={}&api_key={}",
+                        TVSHOWS_VIEW_ID, token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(root_response.status(), 200);
+
+        let root_body = axum::body::to_bytes(root_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let root_value: Value = serde_json::from_slice(&root_body).unwrap();
+        let series_id = root_value["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Type"].as_str() == Some("Series"))
+            .and_then(|item| item["Id"].as_str())
+            .unwrap()
+            .to_string();
+
+        let seasons_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?ParentId={}&api_key={}", series_id, token))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seasons_response.status(), 200);
+
+        let seasons_body = axum::body::to_bytes(seasons_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let seasons_value: Value = serde_json::from_slice(&seasons_body).unwrap();
+        assert_eq!(seasons_value["TotalRecordCount"].as_u64(), Some(1));
+        let season_id = seasons_value["Items"][0]["Id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(seasons_value["Items"][0]["Type"].as_str(), Some("Season"));
+
+        let episodes_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?ParentId={}&api_key={}", season_id, token))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(episodes_response.status(), 200);
+
+        let episodes_body = axum::body::to_bytes(episodes_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let episodes_value: Value = serde_json::from_slice(&episodes_body).unwrap();
+        assert_eq!(episodes_value["TotalRecordCount"].as_u64(), Some(2));
+        assert_eq!(episodes_value["Items"][0]["Type"].as_str(), Some("Episode"));
+        let episode_id = episodes_value["Items"][0]["Id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let playback_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/emby/Items/{}/PlaybackInfo?api_key={}",
+                        episode_id, token
+                    ))
+                    .header("host", "media.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(playback_response.status(), 200);
+
+        let playback_body = axum::body::to_bytes(playback_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let playback_value: Value = serde_json::from_slice(&playback_body).unwrap();
+        assert!(playback_value["MediaSources"][0]["DirectStreamUrl"]
+            .as_str()
+            .unwrap()
+            .contains("/emby/Videos/episode:2/original"));
     }
 
     #[tokio::test]
@@ -874,11 +1374,77 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         let media_source = &value["MediaSources"][0];
-        assert!(media_source["DirectStreamUrl"].as_str().unwrap().contains("/emby/Videos/1/original"));
-        assert!(media_source["TranscodingUrl"].as_str().unwrap().contains("/emby/Videos/1/stream.mp4"));
+        assert!(media_source["DirectStreamUrl"]
+            .as_str()
+            .unwrap()
+            .contains("/emby/Videos/1/original"));
+        assert!(media_source["TranscodingUrl"]
+            .as_str()
+            .unwrap()
+            .contains("/emby/Videos/1/stream.mp4"));
+        assert_eq!(media_source["RunTimeTicks"].as_u64(), Some(98_400_000_000));
+    }
+
+    #[tokio::test]
+    async fn test_items_query_by_ids_backfills_runtime_ticks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ffprobe_path = write_fake_ffprobe(&temp_dir);
+        let movie_path = temp_dir.path().join("movie.mp4");
+        std::fs::write(&movie_path, b"movie").unwrap();
+
+        let ffprobe_path_string = ffprobe_path.to_string_lossy().into_owned();
+        let _guard = EnvGuard::set_owned(&[
+            ("RMC_ADMIN_USERNAME", "admin".to_string()),
+            ("RMC_ADMIN_PASSWORD", "admin".to_string()),
+            ("RMC_JWT_SECRET", "emby-test-secret".to_string()),
+            ("RMC_FFPROBE_CMD", ffprobe_path_string),
+        ]);
+
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        db.insert_movie(&Movie {
+            id: 1,
+            title: "Unknown Runtime".to_string(),
+            year: Some(2024),
+            file_path: movie_path,
+            poster_url: Some("https://example.com/poster.jpg".to_string()),
+            overview: Some("Needs ffprobe.".to_string()),
+            tmdb_id: None,
+            runtime_minutes: None,
+            runtime_seconds: None,
+            added_at: 1_717_896_000,
+            file_size: Some(123_456_789),
+        })
+        .await
+        .unwrap();
+        let app = crate::api::app_router(db);
+        let token = emby_login(app.clone()).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/emby/Items?Ids=1&api_key={}", token))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["Items"][0]["RunTimeTicks"].as_u64(),
+            Some(1_870_000_000)
+        );
     }
 
     #[tokio::test]
@@ -903,7 +1469,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(
-            response.headers().get(header::LOCATION).and_then(|value| value.to_str().ok()),
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
             Some("https://example.com/poster.jpg")
         );
     }

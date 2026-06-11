@@ -1,4 +1,4 @@
-use wgpu::{Instance, InstanceDescriptor, Backends};
+use wgpu::{Backends, Instance, InstanceDescriptor};
 
 pub struct VideoRenderer {
     adapter_name: Option<String>,
@@ -10,13 +10,15 @@ impl VideoRenderer {
             backends: Backends::all(),
             ..Default::default()
         });
-        
-        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }).await;
-        
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await;
+
         Self {
             adapter_name: adapter.map(|a| a.get_info().name),
         }

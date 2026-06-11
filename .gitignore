@@ -1,5 +1,8 @@
 target
 
+.codex
+.claude
+
 docs
 
 config.toml

@@ -29,7 +29,10 @@ impl PosterWall {
         // 用简单的列展示（未来再进化为真正的虚拟网格或包裹排版）
         let mut col = column![].spacing(10);
         for m in &self.movies {
-            let year_str = m.year.map(|y| y.to_string()).unwrap_or_else(|| "Unknown".to_string());
+            let year_str = m
+                .year
+                .map(|y| y.to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
             // 目前先显示文本和标题，后续配合网络加载图片
             col = col.push(text(format!("{} ({})", m.title, year_str)));
         }
@@ -51,7 +54,7 @@ mod tests {
     fn test_poster_wall_view_type() {
         let wall = PosterWall::new(vec![]);
         // iced 的 view 方法应该返回一个能够被类型检查为 widget 的组件结构
-        let _widget = wall.view::<()>(); 
+        let _widget = wall.view::<()>();
         assert_eq!(wall.count(), 0);
     }
 
@@ -68,6 +71,7 @@ mod tests {
                 overview: None,
                 tmdb_id: None,
                 runtime_minutes: None,
+                runtime_seconds: None,
                 added_at: 0,
                 file_size: None,
             },
@@ -80,6 +84,7 @@ mod tests {
                 overview: None,
                 tmdb_id: None,
                 runtime_minutes: None,
+                runtime_seconds: None,
                 added_at: 0,
                 file_size: None,
             },

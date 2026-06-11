@@ -1,5 +1,5 @@
-use rmc_core::models::Movie;
 use reqwest::Client;
+use rmc_core::models::Movie;
 
 pub struct ApiClient {
     base_url: String,
@@ -8,7 +8,7 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(base_url: String) -> Self {
-        Self { 
+        Self {
             base_url,
             client: Client::new(),
         }
@@ -16,8 +16,13 @@ impl ApiClient {
 
     pub async fn fetch_movies(&self) -> Result<Vec<Movie>, String> {
         let url = format!("{}/api/v1/movies", self.base_url);
-        let res = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
-        
+        let res = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
         if res.status().is_success() {
             let movies = res.json::<Vec<Movie>>().await.map_err(|e| e.to_string())?;
             Ok(movies)
@@ -38,6 +43,10 @@ mod tests {
         let res = client.fetch_movies().await;
         assert!(res.is_err());
         let err_msg = res.unwrap_err();
-        assert!(err_msg.contains("Connection refused") || err_msg.contains("connect") || err_msg.contains("error sending request"));
+        assert!(
+            err_msg.contains("Connection refused")
+                || err_msg.contains("connect")
+                || err_msg.contains("error sending request")
+        );
     }
 }

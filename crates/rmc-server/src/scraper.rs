@@ -26,8 +26,7 @@ struct TmdbMovie {
 
 impl TmdbScraper {
     pub fn new(api_key: String, proxy_url: Option<String>, api_base: Option<String>) -> Self {
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10));
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
 
         let proxy_url = proxy_url.filter(|s| !s.trim().is_empty());
         let api_base = api_base.filter(|s| !s.trim().is_empty());
@@ -39,10 +38,41 @@ impl TmdbScraper {
         }
 
         let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
-        Self { api_key, client, api_base }
+        Self {
+            api_key,
+            client,
+            api_base,
+        }
     }
 
-    pub async fn fetch_movie_metadata(&self, title: &str) -> Result<Movie, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn fetch_movie_metadata(
+        &self,
+        title: &str,
+        year: Option<u16>,
+    ) -> Result<Movie, Box<dyn std::error::Error + Send + Sync>> {
+        let query_candidates = build_query_candidates(title, year);
+
+        let mut last_error = None;
+        for (query_title, query_year) in query_candidates {
+            tracing::debug!(
+                query = query_title,
+                year = query_year,
+                "Searching TMDB movie metadata"
+            );
+            match self.search_movie(&query_title, query_year).await {
+                Ok(movie) => return Ok(movie),
+                Err(err) => last_error = Some(err),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| "No matching movie found on TMDB".into()))
+    }
+
+    async fn search_movie(
+        &self,
+        title: &str,
+        year: Option<u16>,
+    ) -> Result<Movie, Box<dyn std::error::Error + Send + Sync>> {
         let url = if let Some(ref base) = self.api_base {
             let base_trimmed = base.trim_end_matches('/');
             format!("{}/3/search/movie", base_trimmed)
@@ -50,39 +80,56 @@ impl TmdbScraper {
             TMDB_API_URL.to_string()
         };
 
-        let response = self.client.get(&url)
-            .query(&[
-                ("api_key", self.api_key.as_str()),
-                ("query", title),
-                ("language", "zh-CN"),
-            ])
+        let mut query_params = vec![
+            ("api_key", self.api_key.clone()),
+            ("query", title.to_string()),
+            ("language", "zh-CN".to_string()),
+        ];
+        if let Some(year) = year {
+            query_params.push(("year", year.to_string()));
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .query(&query_params)
             .send()
             .await
             .map_err(|e| format!("TMDB request failed for {}: {}", url, e))?;
-        
+
         if !response.status().is_success() {
             let status = response.status();
             let err_body = response.text().await.unwrap_or_default();
-            return Err(format!("TMDB API error: status code {}, response: {}", status, err_body).into());
+            return Err(format!(
+                "TMDB API error: status code {}, response: {}",
+                status, err_body
+            )
+            .into());
         }
-        
+
         let text = response.text().await?;
-        let search_response: TmdbSearchResponse = serde_json::from_str(&text)
-            .map_err(|e| format!("Failed to parse TMDB JSON response: {}, response body: {}", e, text))?;
-            
+        let search_response: TmdbSearchResponse = serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "Failed to parse TMDB JSON response: {}, response body: {}",
+                e, text
+            )
+        })?;
+
         if search_response.results.is_empty() {
             return Err("No matching movie found on TMDB".into());
         }
 
         let best_match = &search_response.results[0];
-        
-        let poster_url = best_match.poster_path.as_ref().map(|path| {
-            format!("{}{}", TMDB_IMAGE_BASE, path)
-        });
 
-        let year = best_match.release_date.as_ref().and_then(|date| {
-            date.split('-').next().and_then(|y| y.parse::<u16>().ok())
-        });
+        let poster_url = best_match
+            .poster_path
+            .as_ref()
+            .map(|path| format!("{}{}", TMDB_IMAGE_BASE, path));
+
+        let year = best_match
+            .release_date
+            .as_ref()
+            .and_then(|date| date.split('-').next().and_then(|y| y.parse::<u16>().ok()));
 
         Ok(Movie {
             id: 0,
@@ -93,28 +140,85 @@ impl TmdbScraper {
             overview: best_match.overview.clone(),
             tmdb_id: Some(best_match.id),
             runtime_minutes: None,
+            runtime_seconds: None,
             added_at: 0,
             file_size: None,
         })
     }
 }
 
+fn build_query_candidates(title: &str, year: Option<u16>) -> Vec<(String, Option<u16>)> {
+    let raw_title = title.trim();
+    let normalized_title = normalize_query_title(raw_title);
+    let primary_title = if normalized_title.is_empty() {
+        raw_title.to_string()
+    } else {
+        normalized_title
+    };
+
+    let mut candidates = Vec::new();
+    push_query_candidate(&mut candidates, primary_title.clone(), year);
+    push_query_candidate(&mut candidates, primary_title.clone(), None);
+
+    if primary_title != raw_title {
+        push_query_candidate(&mut candidates, raw_title.to_string(), year);
+        push_query_candidate(&mut candidates, raw_title.to_string(), None);
+    }
+
+    candidates
+}
+
+fn push_query_candidate(
+    candidates: &mut Vec<(String, Option<u16>)>,
+    title: String,
+    year: Option<u16>,
+) {
+    if title.trim().is_empty() {
+        return;
+    }
+
+    if !candidates
+        .iter()
+        .any(|(existing_title, existing_year)| existing_title == &title && existing_year == &year)
+    {
+        candidates.push((title, year));
+    }
+}
+
+fn normalize_query_title(title: &str) -> String {
+    let (normalized_title, _) = crate::scanner::parse_filename(title);
+    normalized_title.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_query_title_removes_release_noise() {
+        assert_eq!(
+            normalize_query_title("Movie.Name.2021.1080p.BluRay.x265-GROUP"),
+            "Movie Name"
+        );
+        assert_eq!(
+            normalize_query_title("Tiny.World.S01E04.HDR.2160p.WEB.h265-KOGi"),
+            "Tiny World"
+        );
+        assert_eq!(normalize_query_title("Inception"), "Inception");
+    }
 
     #[tokio::test]
     async fn test_fetch_metadata() {
         let scraper = TmdbScraper::new("dummy_key".to_string(), None, None);
         // 期望在没有网络或错误 key 时返回清晰的 Error，而不是目前的 stub string
-        let res = scraper.fetch_movie_metadata("Inception").await;
+        let res = scraper.fetch_movie_metadata("Inception", None).await;
         assert!(res.is_err());
     }
 
     #[tokio::test]
     async fn test_fetch_metadata_live_mock() {
         let scraper = TmdbScraper::new("invalid_api_key_test_123".to_string(), None, None);
-        let res = scraper.fetch_movie_metadata("Inception").await;
+        let res = scraper.fetch_movie_metadata("Inception", None).await;
         assert!(res.is_err());
         let err_msg = res.unwrap_err().to_string();
         assert!(
@@ -135,7 +239,7 @@ mod tests {
             None,
             Some("https://invalid.domain.tmdb-proxy.com".to_string()),
         );
-        let res = scraper.fetch_movie_metadata("Inception").await;
+        let res = scraper.fetch_movie_metadata("Inception", None).await;
         assert!(res.is_err());
         let err_msg = res.unwrap_err().to_string();
         assert!(
@@ -152,7 +256,7 @@ mod tests {
             None,
             Some("   ".to_string()),
         );
-        let res = scraper.fetch_movie_metadata("Inception").await;
+        let res = scraper.fetch_movie_metadata("Inception", None).await;
         assert!(res.is_err());
         let err_msg = res.unwrap_err().to_string();
         assert!(

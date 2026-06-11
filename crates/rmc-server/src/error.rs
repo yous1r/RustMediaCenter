@@ -10,7 +10,7 @@ use thiserror::Error;
 pub enum AppError {
     #[error("Internal Server Error: {0}")]
     Internal(#[from] anyhow::Error),
-    
+
     #[error("Not Found: {0}")]
     NotFound(String),
 

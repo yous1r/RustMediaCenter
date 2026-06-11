@@ -3,6 +3,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::process::{Child, ChildStdout, Command};
@@ -18,6 +19,8 @@ const DEFAULT_RENDER_DEVICE: &str = "/dev/dri/renderD128";
 const DEFAULT_MEDIASRV_LIB_PATH: &str = "/usr/trim/lib/mediasrv";
 const DEFAULT_LIBVA_DRIVER_NAME: &str = "iHD";
 const FFMPEG_LOG_NAME: &str = "ffmpeg.log";
+
+static STREAM_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub enum SessionState {
     Spawning,
@@ -59,6 +62,15 @@ enum TranscodeStrategy {
     Software,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TranscodeQuality {
+    Source,
+    P1080,
+    P720,
+    P480,
+    P360,
+}
+
 #[derive(Debug)]
 struct TranscodeRuntimeConfig {
     ffmpeg_cmd: String,
@@ -69,6 +81,88 @@ struct TranscodeRuntimeConfig {
     ld_library_path: Option<String>,
     hls_time_secs: u64,
     stream_fragment_secs: u64,
+}
+
+impl TranscodeQuality {
+    pub fn from_label(raw: Option<&str>) -> Self {
+        match raw.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+            "1080" | "1080p" | "fhd" => Self::P1080,
+            "720" | "720p" | "hd" => Self::P720,
+            "480" | "480p" | "sd" => Self::P480,
+            "360" | "360p" | "low" => Self::P360,
+            _ => Self::Source,
+        }
+    }
+
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::P1080 => "1080p",
+            Self::P720 => "720p",
+            Self::P480 => "480p",
+            Self::P360 => "360p",
+        }
+    }
+
+    fn max_height(self) -> Option<u16> {
+        match self {
+            Self::Source => None,
+            Self::P1080 => Some(1080),
+            Self::P720 => Some(720),
+            Self::P480 => Some(480),
+            Self::P360 => Some(360),
+        }
+    }
+
+    fn video_bitrate(self, strategy: TranscodeStrategy) -> &'static str {
+        match self {
+            Self::Source if matches!(strategy, TranscodeStrategy::Software) => "2M",
+            Self::Source => "3M",
+            Self::P1080 => "4M",
+            Self::P720 => "2500k",
+            Self::P480 => "1200k",
+            Self::P360 => "700k",
+        }
+    }
+
+    fn maxrate(self) -> &'static str {
+        match self {
+            Self::Source => "4M",
+            Self::P1080 => "5M",
+            Self::P720 => "3M",
+            Self::P480 => "1600k",
+            Self::P360 => "900k",
+        }
+    }
+
+    fn bufsize(self) -> &'static str {
+        match self {
+            Self::Source => "6M",
+            Self::P1080 => "8M",
+            Self::P720 => "5M",
+            Self::P480 => "2400k",
+            Self::P360 => "1400k",
+        }
+    }
+
+    fn scale_filter(self) -> Option<String> {
+        self.max_height()
+            .map(|height| format!("scale=-2:min({height}\\,ih)"))
+    }
+
+    fn qsv_filter(self) -> String {
+        match self.scale_filter() {
+            Some(scale) => format!("{scale},format=nv12,hwupload=extra_hw_frames=64"),
+            None => "format=nv12,hwupload=extra_hw_frames=64".to_string(),
+        }
+    }
+
+    fn vaapi_filter(self) -> String {
+        match self.scale_filter() {
+            Some(scale) => format!("{scale},format=nv12,hwupload"),
+            None => "format=nv12,hwupload".to_string(),
+        }
+    }
 }
 
 impl HardwareAccelMode {
@@ -106,6 +200,14 @@ impl HardwareAccelMode {
 }
 
 impl TranscodeStrategy {
+    fn append_start_time_args(args: &mut Vec<String>, start_time_secs: Option<f64>) {
+        if let Some(start_time_secs) =
+            start_time_secs.filter(|value| value.is_finite() && *value > 0.0)
+        {
+            args.extend(["-ss".to_string(), format!("{start_time_secs:.3}")]);
+        }
+    }
+
     fn append_input_args(args: &mut Vec<String>, input_path: &str, input_headers: Option<&str>) {
         if let Some(headers) = input_headers.filter(|value| !value.trim().is_empty()) {
             args.extend(["-headers".to_string(), headers.to_string()]);
@@ -226,6 +328,8 @@ impl TranscodeStrategy {
         render_device: &str,
         fragment_secs: u64,
         input_headers: Option<&str>,
+        start_time_secs: Option<f64>,
+        quality: TranscodeQuality,
     ) -> Vec<String> {
         let mut args = Vec::new();
 
@@ -238,20 +342,21 @@ impl TranscodeStrategy {
                     "-filter_hw_device".to_string(),
                     "hw".to_string(),
                 ]);
+                Self::append_start_time_args(&mut args, start_time_secs);
                 Self::append_input_args(&mut args, input_path, input_headers);
                 args.extend([
                     "-vf".to_string(),
-                    "format=nv12,hwupload=extra_hw_frames=64".to_string(),
+                    quality.qsv_filter(),
                     "-c:v".to_string(),
                     "h264_qsv".to_string(),
                     "-preset".to_string(),
                     "fast".to_string(),
                     "-b:v".to_string(),
-                    "3M".to_string(),
+                    quality.video_bitrate(self).to_string(),
                     "-maxrate".to_string(),
-                    "4M".to_string(),
+                    quality.maxrate().to_string(),
                     "-bufsize".to_string(),
-                    "6M".to_string(),
+                    quality.bufsize().to_string(),
                 ]);
             }
             Self::Vaapi => {
@@ -262,30 +367,35 @@ impl TranscodeStrategy {
                     "-filter_hw_device".to_string(),
                     "va".to_string(),
                 ]);
+                Self::append_start_time_args(&mut args, start_time_secs);
                 Self::append_input_args(&mut args, input_path, input_headers);
                 args.extend([
                     "-vf".to_string(),
-                    "format=nv12,hwupload".to_string(),
+                    quality.vaapi_filter(),
                     "-c:v".to_string(),
                     "h264_vaapi".to_string(),
                     "-b:v".to_string(),
-                    "3M".to_string(),
+                    quality.video_bitrate(self).to_string(),
                     "-maxrate".to_string(),
-                    "4M".to_string(),
+                    quality.maxrate().to_string(),
                     "-bufsize".to_string(),
-                    "6M".to_string(),
+                    quality.bufsize().to_string(),
                 ]);
             }
             Self::Software => {
                 args.push("-y".to_string());
+                Self::append_start_time_args(&mut args, start_time_secs);
                 Self::append_input_args(&mut args, input_path, input_headers);
+                if let Some(scale_filter) = quality.scale_filter() {
+                    args.extend(["-vf".to_string(), scale_filter]);
+                }
                 args.extend([
                     "-c:v".to_string(),
                     "libx264".to_string(),
                     "-preset".to_string(),
                     "veryfast".to_string(),
                     "-b:v".to_string(),
-                    "2M".to_string(),
+                    quality.video_bitrate(self).to_string(),
                 ]);
             }
         }
@@ -319,7 +429,11 @@ impl TranscodeRuntimeConfig {
         let libva_driver_name = std::env::var("RMC_LIBVA_DRIVER_NAME")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| default_lib_path.as_ref().map(|_| DEFAULT_LIBVA_DRIVER_NAME.to_string()));
+            .or_else(|| {
+                default_lib_path
+                    .as_ref()
+                    .map(|_| DEFAULT_LIBVA_DRIVER_NAME.to_string())
+            });
 
         let libva_drivers_path = std::env::var("RMC_LIBVA_DRIVERS_PATH")
             .ok()
@@ -373,7 +487,12 @@ fn read_u64_env(env_key: &str, default_value: u64) -> u64 {
         Ok(raw) => match raw.trim().parse::<u64>() {
             Ok(value) if value > 0 => value,
             Ok(_) | Err(_) => {
-                tracing::warn!(env_key, value = raw, default_value, "Invalid numeric env override, using default");
+                tracing::warn!(
+                    env_key,
+                    value = raw,
+                    default_value,
+                    "Invalid numeric env override, using default"
+                );
                 default_value
             }
         },
@@ -412,6 +531,15 @@ fn format_status(status: std::process::ExitStatus) -> String {
         Some(code) => code.to_string(),
         None => "signal".to_string(),
     }
+}
+
+fn next_stream_session_suffix() -> u128 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let counter = STREAM_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    (millis << 16) | (counter & 0xffff)
 }
 
 async fn probe_startup(child: &mut Child, m3u8_path: &Path) -> Result<(), String> {
@@ -511,7 +639,8 @@ impl TranscodeManager {
                     let mut to_remove = Vec::new();
 
                     for (id, session) in guard.iter() {
-                        if now.saturating_duration_since(session.last_heartbeat) > heartbeat_timeout {
+                        if now.saturating_duration_since(session.last_heartbeat) > heartbeat_timeout
+                        {
                             to_remove.push(*id);
                         }
                     }
@@ -523,7 +652,8 @@ impl TranscodeManager {
                                 .unwrap_or_default()
                                 .as_millis();
                             let cleanup_dir = format!("{}-cleanup-{}", session.output_dir, millis);
-                            let renamed = std::fs::rename(&session.output_dir, &cleanup_dir).is_ok();
+                            let renamed =
+                                std::fs::rename(&session.output_dir, &cleanup_dir).is_ok();
                             let actual_cleanup_dir = if renamed {
                                 cleanup_dir
                             } else {
@@ -672,7 +802,10 @@ impl TranscodeManager {
         if let Some(value) = &runtime.ld_library_path {
             append_log_line(&log_path, format!("LD_LIBRARY_PATH={}", value));
         }
-        append_log_line(&log_path, format!("RMC_HLS_TIME_SECS={}", runtime.hls_time_secs));
+        append_log_line(
+            &log_path,
+            format!("RMC_HLS_TIME_SECS={}", runtime.hls_time_secs),
+        );
 
         let mut final_child = None;
         let mut last_error = String::new();
@@ -789,6 +922,8 @@ impl TranscodeManager {
         movie_id: i64,
         input_path: &str,
         input_headers: Option<&str>,
+        start_time_secs: Option<f64>,
+        quality: TranscodeQuality,
     ) -> Result<StreamTranscodeSession, Box<dyn std::error::Error + Send + Sync>> {
         if !Path::new(input_path).exists() && !input_path.starts_with("http") {
             return Err(Box::new(std::io::Error::new(
@@ -797,10 +932,12 @@ impl TranscodeManager {
             )));
         }
 
-        let output_dir = format!("{}/stream-{}", self.base_temp_dir, movie_id);
-        if Path::new(&output_dir).exists() {
-            let _ = tokio::fs::remove_dir_all(&output_dir).await;
-        }
+        let output_dir = format!(
+            "{}/stream-{}-{}",
+            self.base_temp_dir,
+            movie_id,
+            next_stream_session_suffix()
+        );
         tokio::fs::create_dir_all(&output_dir).await?;
 
         let cleanup_dir = PathBuf::from(&output_dir);
@@ -814,6 +951,7 @@ impl TranscodeManager {
                 movie_id, runtime.mode, runtime.render_device, runtime.ffmpeg_cmd
             ),
         );
+        append_log_line(&log_path, format!("quality={}", quality.as_label()));
 
         let mut last_error = String::new();
 
@@ -838,6 +976,8 @@ impl TranscodeManager {
                 &runtime.render_device,
                 runtime.stream_fragment_secs,
                 input_headers,
+                start_time_secs,
+                quality,
             );
             append_log_line(
                 &log_path,
@@ -1133,6 +1273,60 @@ fi
         std::env::remove_var("RMC_TRANSCODE_MODE");
     }
 
+    #[tokio::test]
+    async fn test_stream_transcode_uses_unique_cleanup_dirs_per_request() {
+        let _guard = env_lock().lock().await;
+
+        let temp_dir_fixture = tempfile::tempdir().unwrap();
+        let transcode_dir = temp_dir_fixture.path();
+        let mock_script = transcode_dir.join("mock_ffmpeg_stream_unique.sh");
+
+        std::fs::write(&mock_script, "#!/bin/sh\nsleep 100\n").unwrap();
+        let mut perms = std::fs::metadata(&mock_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&mock_script, perms).unwrap();
+
+        std::env::set_var("RMC_FFMPEG_CMD", mock_script.to_string_lossy().to_string());
+        std::env::set_var("RMC_TRANSCODE_MODE", "software");
+
+        let manager = TranscodeManager::new(transcode_dir.to_string_lossy().to_string());
+        let session_a = manager
+            .start_stream_transcode(
+                88,
+                "http://invalid/path.mp4",
+                None,
+                None,
+                TranscodeQuality::Source,
+            )
+            .await
+            .expect("first stream session should start");
+        let session_b = manager
+            .start_stream_transcode(
+                88,
+                "http://invalid/path.mp4",
+                None,
+                Some(15.0),
+                TranscodeQuality::Source,
+            )
+            .await
+            .expect("second stream session should start");
+
+        assert_ne!(session_a.cleanup_dir, session_b.cleanup_dir);
+
+        let mut child_a = session_a.child;
+        let mut child_b = session_b.child;
+        let cleanup_dir_a = session_a.cleanup_dir;
+        let cleanup_dir_b = session_b.cleanup_dir;
+
+        let _ = child_a.kill().await;
+        let _ = child_b.kill().await;
+        let _ = tokio::fs::remove_dir_all(cleanup_dir_a).await;
+        let _ = tokio::fs::remove_dir_all(cleanup_dir_b).await;
+
+        std::env::remove_var("RMC_FFMPEG_CMD");
+        std::env::remove_var("RMC_TRANSCODE_MODE");
+    }
+
     #[test]
     fn test_hardware_args_include_hwupload_filters_for_10bit_sources() {
         let qsv_args = TranscodeStrategy::Qsv.build_args(
@@ -1152,17 +1346,84 @@ fi
             None,
         );
 
-        assert!(qsv_args.windows(2).any(|w| w == ["-filter_hw_device", "hw"]));
-        assert!(qsv_args.windows(2).any(|w| w == ["-vf", "format=nv12,hwupload=extra_hw_frames=64"]));
+        assert!(qsv_args
+            .windows(2)
+            .any(|w| w == ["-filter_hw_device", "hw"]));
+        assert!(qsv_args
+            .windows(2)
+            .any(|w| w == ["-vf", "format=nv12,hwupload=extra_hw_frames=64"]));
         assert!(!qsv_args.iter().any(|arg| arg == "-hwaccel"));
         assert!(qsv_args.windows(2).any(|w| w == ["-hls_time", "6"]));
-        assert!(qsv_args.windows(2).any(|w| w == ["-hls_flags", "independent_segments"]));
-        assert!(qsv_args.windows(2).any(|w| w == ["-force_key_frames", "expr:gte(t,n_forced*6)"]));
+        assert!(qsv_args
+            .windows(2)
+            .any(|w| w == ["-hls_flags", "independent_segments"]));
+        assert!(qsv_args
+            .windows(2)
+            .any(|w| w == ["-force_key_frames", "expr:gte(t,n_forced*6)"]));
 
-        assert!(vaapi_args.windows(2).any(|w| w == ["-filter_hw_device", "va"]));
-        assert!(vaapi_args.windows(2).any(|w| w == ["-vf", "format=nv12,hwupload"]));
+        assert!(vaapi_args
+            .windows(2)
+            .any(|w| w == ["-filter_hw_device", "va"]));
+        assert!(vaapi_args
+            .windows(2)
+            .any(|w| w == ["-vf", "format=nv12,hwupload"]));
         assert!(!vaapi_args.iter().any(|arg| arg == "-hwaccel"));
         assert!(vaapi_args.windows(2).any(|w| w == ["-hls_time", "6"]));
-        assert!(vaapi_args.windows(2).any(|w| w == ["-hls_flags", "independent_segments"]));
+        assert!(vaapi_args
+            .windows(2)
+            .any(|w| w == ["-hls_flags", "independent_segments"]));
+    }
+
+    #[test]
+    fn test_stream_args_include_seek_offset_before_input() {
+        let args = TranscodeStrategy::Software.build_stream_args(
+            "/input.mkv",
+            "/dev/dri/renderD128",
+            DEFAULT_STREAM_FRAGMENT_SECS,
+            None,
+            Some(125.5),
+            TranscodeQuality::Source,
+        );
+
+        let seek_index = args
+            .iter()
+            .position(|arg| arg == "-ss")
+            .expect("missing -ss");
+        let input_index = args.iter().position(|arg| arg == "-i").expect("missing -i");
+
+        assert!(seek_index < input_index);
+        assert!(args.windows(2).any(|w| w == ["-ss", "125.500"]));
+    }
+
+    #[test]
+    fn test_stream_args_apply_quality_scale_and_bitrate() {
+        let args = TranscodeStrategy::Software.build_stream_args(
+            "/input.mkv",
+            "/dev/dri/renderD128",
+            DEFAULT_STREAM_FRAGMENT_SECS,
+            None,
+            None,
+            TranscodeQuality::P720,
+        );
+
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-vf", "scale=-2:min(720\\,ih)"]));
+        assert!(args.windows(2).any(|w| w == ["-b:v", "2500k"]));
+    }
+
+    #[test]
+    fn test_stream_args_keep_source_quality_without_scale() {
+        let args = TranscodeStrategy::Software.build_stream_args(
+            "/input.mkv",
+            "/dev/dri/renderD128",
+            DEFAULT_STREAM_FRAGMENT_SECS,
+            None,
+            None,
+            TranscodeQuality::Source,
+        );
+
+        assert!(!args.iter().any(|arg| arg.starts_with("scale=")));
+        assert!(args.windows(2).any(|w| w == ["-b:v", "2M"]));
     }
 }

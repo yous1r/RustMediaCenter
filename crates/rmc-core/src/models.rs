@@ -10,6 +10,7 @@ pub struct Movie {
     pub overview: Option<String>,
     pub tmdb_id: Option<i64>,
     pub runtime_minutes: Option<u16>,
+    pub runtime_seconds: Option<u32>,
     pub added_at: i64,
     pub file_size: Option<u64>,
 }
@@ -43,6 +44,7 @@ mod tests {
             overview: Some("This is a test movie overview".to_string()),
             tmdb_id: Some(12345),
             runtime_minutes: Some(120),
+            runtime_seconds: Some(7_215),
             added_at: 1718021000,
             file_size: Some(1024000),
         };
@@ -52,16 +54,20 @@ mod tests {
         assert!(json.contains(r#""overview":"This is a test movie overview""#));
         assert!(json.contains(r#""tmdb_id":12345"#));
         assert!(json.contains(r#""runtime_minutes":120"#));
+        assert!(json.contains(r#""runtime_seconds":7215"#));
         assert!(json.contains(r#""added_at":1718021000"#));
         assert!(json.contains(r#""file_size":1024000"#));
-        
+
         let deserialized: Movie = serde_json::from_str(&json).unwrap();
         assert_eq!(movie, deserialized);
     }
 
     #[test]
     fn test_user_model() {
-        let user = User { id: 1, username: "admin".to_string() };
+        let user = User {
+            id: 1,
+            username: "admin".to_string(),
+        };
         assert_eq!(user.username, "admin");
     }
 

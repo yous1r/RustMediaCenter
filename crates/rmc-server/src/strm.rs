@@ -23,7 +23,10 @@ pub struct StrmParser;
 
 impl StrmParser {
     pub fn parse(content: &str) -> Option<StrmSource> {
-        let mut lines = content.lines().map(str::trim).filter(|line| !line.is_empty());
+        let mut lines = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
         let url = lines.find(|line| line.starts_with("http"))?.to_string();
         let headers = lines
             .filter_map(|line| {
