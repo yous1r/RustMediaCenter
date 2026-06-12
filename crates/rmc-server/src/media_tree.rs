@@ -356,6 +356,36 @@ fn detect_episode_info(movie: &Movie) -> Option<EpisodeInfo> {
     let stem = movie.file_path.file_stem()?.to_str()?;
     let sanitized_stem = crate::scanner::strip_release_bracket_suffixes(stem);
 
+    if let Some((episode_number, title_override)) = detect_tv_reproduction(stem) {
+        return Some(EpisodeInfo {
+            season_number: 0,
+            episode_number,
+            title_override: Some(title_override),
+        });
+    }
+
+    if sanitized_stem != stem {
+        if let Some((episode_number, title_override)) = detect_tv_reproduction(&sanitized_stem) {
+            return Some(EpisodeInfo {
+                season_number: 0,
+                episode_number,
+                title_override: Some(title_override),
+            });
+        }
+    }
+
+    if let Some(info) = detect_contextual_special_info(movie.file_path.parent(), stem) {
+        return Some(info);
+    }
+
+    if sanitized_stem != stem {
+        if let Some(info) =
+            detect_contextual_special_info(movie.file_path.parent(), &sanitized_stem)
+        {
+            return Some(info);
+        }
+    }
+
     if let Some(info) = detect_episode_info_in_text(stem) {
         return Some(info);
     }
@@ -516,12 +546,45 @@ fn detect_season_from_ancestors(mut path: Option<&Path>) -> Option<u16> {
     None
 }
 
+fn detect_contextual_special_info(path: Option<&Path>, stem: &str) -> Option<EpisodeInfo> {
+    let (special_context, label) = detect_special_context(path)?;
+    let (episode_number, title) = detect_special_file_number_and_title(stem, &label)?;
+    Some(EpisodeInfo {
+        season_number: if special_context { 0 } else { 1 },
+        episode_number,
+        title_override: Some(title),
+    })
+}
+
+fn detect_special_context(path: Option<&Path>) -> Option<(bool, String)> {
+    let mut current = path;
+    while let Some(segment_path) = current {
+        let segment = segment_path.file_name()?.to_str()?;
+        if let Some(label) = special_context_label(segment) {
+            return Some((true, label));
+        }
+        current = segment_path.parent();
+    }
+    None
+}
+
+fn special_context_label(segment: &str) -> Option<String> {
+    let normalized = normalize_segment(segment);
+    let label = match normalized.as_str() {
+        "sp" | "sps" | "special" | "specials" | "extras" => "Special",
+        "ova" | "ovas" | "oad" | "oads" => "OVA",
+        "pv" | "pvs" | "preview" | "previews" => "PV",
+        "menu" | "menus" => "Menu",
+        "cd" | "cds" => "CD",
+        "ncop" => "NCOP",
+        "nced" => "NCED",
+        _ => return None,
+    };
+    Some(label.to_string())
+}
+
 fn special_season_segment(segment: &str) -> bool {
-    let normalized = segment.trim().to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "sp" | "sps" | "special" | "specials" | "extras" | "ova" | "ovas" | "oad" | "oads" | "ncop" | "nced"
-    )
+    special_context_label(segment).is_some()
 }
 
 fn detect_special_marker(stem: &str) -> Option<(u16, String)> {
@@ -547,39 +610,144 @@ fn detect_special_marker(stem: &str) -> Option<(u16, String)> {
     }
 
     let suffix = SUFFIX_SPECIAL_RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)[ ._-]+-\s*(?P<label>cm|ed|op|pv|menu|tvcm)(?P<episode>\d{1,3})\s*$",
-        )
-        .unwrap()
+        Regex::new(r"(?i)[ ._-]+-\s*(?P<label>cm|ed|op|pv|menu|tvcm)(?P<episode>\d{1,3})\s*$")
+            .unwrap()
     });
     let caps = suffix.captures(stem)?;
     let label = caps.name("label")?.as_str().to_ascii_uppercase();
     let episode = caps.name("episode")?.as_str().parse::<u16>().ok()?;
-    Some((special_sort_number(&label, Some(episode)), format!("{}{}", label, episode)))
+    Some((
+        special_sort_number(&label, Some(episode)),
+        format!("{}{}", label, episode),
+    ))
 }
 
 fn detect_named_special(stem: &str) -> Option<(u16, String)> {
     static SUNNY_DAY_RE: OnceLock<Regex> = OnceLock::new();
-    let sunny_day = SUNNY_DAY_RE
-        .get_or_init(|| Regex::new(r"(?i)[ ._-]+-\s*(sunny[ ._-]+day)\s*$").unwrap());
+    let sunny_day =
+        SUNNY_DAY_RE.get_or_init(|| Regex::new(r"(?i)[ ._-]+-\s*(sunny[ ._-]+day)\s*$").unwrap());
     if sunny_day.is_match(stem) {
-        return Some((special_sort_number("SUNNY DAY", None), "Sunny Day".to_string()));
+        return Some((
+            special_sort_number("SUNNY DAY", None),
+            "Sunny Day".to_string(),
+        ));
     }
     None
 }
 
+fn detect_special_file_number_and_title(stem: &str, context_label: &str) -> Option<(u16, String)> {
+    if let Some((episode_number, title)) = detect_named_special(stem) {
+        return Some((episode_number, title));
+    }
+
+    if let Some((episode_number, title)) = detect_tv_reproduction(stem) {
+        return Some((episode_number, title));
+    }
+
+    if let Some((episode_number, title)) = detect_special_marker(stem) {
+        return Some((episode_number, title));
+    }
+
+    if let Some((episode_number, title)) = detect_plain_labeled_special(stem) {
+        return Some((episode_number, title));
+    }
+
+    let episode_number = crate::scanner::bracket_episode_marker(stem)
+        .map(|(_, episode)| episode)
+        .or_else(|| crate::scanner::loose_numbered_episode_suffix(stem).map(|(_, episode)| episode))
+        .or_else(|| trailing_plain_number(stem))
+        .or_else(|| plain_numeric_episode_number(stem))?;
+
+    let title = match context_label {
+        "Special" => format!("Special {}", episode_number),
+        "OVA" => format!("OVA {}", episode_number),
+        "PV" => format!("PV{}", episode_number),
+        "Menu" => format!("Menu {}", episode_number),
+        "CD" => format!("CD {}", episode_number),
+        "NCOP" => format!("NCOP{}", episode_number),
+        "NCED" => format!("NCED{}", episode_number),
+        _ => format!("{} {}", context_label, episode_number),
+    };
+    Some((
+        special_sort_number(context_label, Some(episode_number)),
+        title,
+    ))
+}
+
+fn detect_tv_reproduction(stem: &str) -> Option<(u16, String)> {
+    static TV_REPRODUCTION_RE: OnceLock<Regex> = OnceLock::new();
+    let re =
+        TV_REPRODUCTION_RE.get_or_init(|| Regex::new(r"(?i)\btv[ ._-]*reproduction\b").unwrap());
+    if !re.is_match(stem) {
+        return None;
+    }
+
+    let episode = crate::scanner::bracket_episode_marker(stem)
+        .map(|(_, episode)| episode)
+        .or_else(|| trailing_plain_number(stem))
+        .unwrap_or(1);
+    Some((
+        special_sort_number("TVREPRODUCTION", Some(episode)),
+        format!("TV Reproduction {}", episode),
+    ))
+}
+
+fn detect_plain_labeled_special(stem: &str) -> Option<(u16, String)> {
+    static PLAIN_LABELED_SPECIAL_RE: OnceLock<Regex> = OnceLock::new();
+    let re = PLAIN_LABELED_SPECIAL_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:^|[\] ._-])(?P<label>cm|ed|op|pv|menu|tvcm|ncop|nced|cd)[ ._-]*(?P<episode>\d{0,3})(?:$|\[|[ ._-])",
+        )
+        .unwrap()
+    });
+    let caps = re.captures(stem)?;
+    let label = caps.name("label")?.as_str().to_ascii_uppercase();
+    let episode = caps
+        .name("episode")
+        .and_then(|value| (!value.as_str().is_empty()).then_some(value.as_str()))
+        .and_then(|value| value.parse::<u16>().ok());
+    let title = match label.as_str() {
+        "MENU" => episode
+            .map(|num| format!("Menu {}", num))
+            .unwrap_or_else(|| "Menu".to_string()),
+        "CD" => episode
+            .map(|num| format!("CD {}", num))
+            .unwrap_or_else(|| "CD".to_string()),
+        _ => episode
+            .map(|num| format!("{}{}", label, num))
+            .unwrap_or_else(|| label.clone()),
+    };
+    Some((special_sort_number(&label, episode), title))
+}
+
 fn special_sort_number(label: &str, episode: Option<u16>) -> u16 {
-    let base = match label {
-        "CM" => 100,
-        "TVCM" => 150,
-        "PV" => 200,
-        "MENU" => 250,
-        "OP" | "NCOP" => 300,
-        "ED" | "NCED" => 400,
-        "SUNNY DAY" => 500,
+    let normalized = normalize_segment(label);
+    let base = match normalized.as_str() {
+        "cd" => 50,
+        "cm" => 100,
+        "tvcm" => 150,
+        "pv" => 200,
+        "menu" => 250,
+        "op" | "ncop" => 300,
+        "ed" | "nced" => 400,
+        "tvreproduction" => 450,
+        "sunnyday" => 500,
+        "special" => 600,
+        "ova" => 700,
         _ => 600,
     };
     base + episode.unwrap_or(1)
+}
+
+fn trailing_plain_number(stem: &str) -> Option<u16> {
+    static TRAILING_NUMBER_RE: OnceLock<Regex> = OnceLock::new();
+    let re = TRAILING_NUMBER_RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[\] ._-])(?P<episode>\d{1,3})(?:v\d+)?\s*$").unwrap()
+    });
+    re.captures(stem)
+        .and_then(|caps| caps.name("episode"))
+        .and_then(|value| value.as_str().parse::<u16>().ok())
+        .filter(|episode| *episode > 0)
 }
 
 fn plain_numeric_episode_number(stem: &str) -> Option<u16> {
@@ -588,7 +756,18 @@ fn plain_numeric_episode_number(stem: &str) -> Option<u16> {
         return None;
     }
 
-    normalized.parse::<u16>().ok().filter(|episode| *episode > 0)
+    normalized
+        .parse::<u16>()
+        .ok()
+        .filter(|episode| *episode > 0)
+}
+
+fn normalize_segment(segment: &str) -> String {
+    segment
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
 }
 
 fn detect_series_context(path: Option<&Path>) -> bool {
@@ -812,6 +991,73 @@ mod tests {
         let info = detect_episode_info(&versioned_episode_movie).unwrap();
         assert_eq!(info.season_number, 1);
         assert_eq!(info.episode_number, 13);
+
+        let late_bracket_movie = movie(
+            13,
+            "Fate Stay Night",
+            "/media/TV/Anime/Fate Stay Night(2006)/[VCB-Studio] Fate Stay Night 2006 [24v2][Ma10p_1080p][x265_flac].mkv",
+        );
+        let info = detect_episode_info(&late_bracket_movie).unwrap();
+        assert_eq!(info.season_number, 1);
+        assert_eq!(info.episode_number, 24);
+
+        let tv_reproduction_movie = movie(
+            14,
+            "Fate Stay Night",
+            "/media/TV/Anime/Fate Stay Night(2006)/[VCB-Studio] Fate Stay Night TV Reproduction [02][Ma10p_1080p][x265_flac].mkv",
+        );
+        let info = detect_episode_info(&tv_reproduction_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 452);
+        assert_eq!(info.title_override.as_deref(), Some("TV Reproduction 2"));
+
+        let goblin_plain_number_movie = movie(
+            15,
+            "Goblin Slayer",
+            "/media/TV/Anime/Goblin Slayer/[Nekomoe kissaten] Goblin Slayer 12 [BDRip 1080p HEVC-10bit FLACx2].mkv",
+        );
+        let info = detect_episode_info(&goblin_plain_number_movie).unwrap();
+        assert_eq!(info.season_number, 1);
+        assert_eq!(info.episode_number, 12);
+
+        let goblin_menu_movie = movie(
+            16,
+            "Goblin Slayer",
+            "/media/TV/Anime/Goblin Slayer/Menus/[Nekomoe kissaten] Goblin Slayer Menu 01 [BDRip 1080p HEVC-10bit FLAC].mkv",
+        );
+        let info = detect_episode_info(&goblin_menu_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 251);
+        assert_eq!(info.title_override.as_deref(), Some("Menu 1"));
+
+        let goblin_cd_movie = movie(
+            17,
+            "Goblin Slayer",
+            "/media/TV/Anime/Goblin Slayer/CDs/[Nekomoe kissaten] Goblin Slayer CD 02.mkv",
+        );
+        let info = detect_episode_info(&goblin_cd_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 52);
+        assert_eq!(info.title_override.as_deref(), Some("CD 2"));
+
+        let goblin_pv_movie = movie(
+            18,
+            "Goblin Slayer",
+            "/media/TV/Anime/Goblin Slayer/SPs/[Nekomoe kissaten] Goblin Slayer PV 01 [BDRip 1080p HEVC-10bit FLAC].mkv",
+        );
+        let info = detect_episode_info(&goblin_pv_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 201);
+        assert_eq!(info.title_override.as_deref(), Some("PV1"));
+
+        let hunter_movie = movie(
+            19,
+            "Hunter X Hunter",
+            "/media/TV/Anime/Hunter X Hunter/[Kamigami] Hunter X Hunter - 06 [x264 1280x720 AAC Sub(CH,JP)].mkv",
+        );
+        let info = detect_episode_info(&hunter_movie).unwrap();
+        assert_eq!(info.season_number, 1);
+        assert_eq!(info.episode_number, 6);
     }
 
     #[test]
@@ -983,5 +1229,77 @@ mod tests {
             .items
             .iter()
             .all(|item| item.kind == LibraryItemKind::Series));
+    }
+
+    #[test]
+    fn test_media_tree_groups_user_anime_samples_into_main_and_specials() {
+        let tree = MediaTree::from_movies(vec![
+            movie(
+                1,
+                "Fate Stay Night",
+                "/vol2/1000/media/TV/Anime/Fate Stay Night(2006)/[VCB-Studio] Fate Stay Night 2006 [20][Ma10p_1080p][x265_flac].mkv",
+            ),
+            movie(
+                2,
+                "Fate Stay Night",
+                "/vol2/1000/media/TV/Anime/Fate Stay Night(2006)/[VCB-Studio] Fate Stay Night 2006 [24v2][Ma10p_1080p][x265_flac].mkv",
+            ),
+            movie(
+                3,
+                "Fate Stay Night",
+                "/vol2/1000/media/TV/Anime/Fate Stay Night(2006)/[VCB-Studio] Fate Stay Night TV Reproduction [01][Ma10p_1080p][x265_flac].mkv",
+            ),
+            movie(
+                4,
+                "Goblin Slayer",
+                "/vol2/1000/media/TV/Anime/Goblin Slayer/[Nekomoe kissaten] Goblin Slayer 01 [BDRip 1080p HEVC-10bit FLACx2].mkv",
+            ),
+            movie(
+                5,
+                "Goblin Slayer",
+                "/vol2/1000/media/TV/Anime/Goblin Slayer/SPs/[Nekomoe kissaten] Goblin Slayer PV 01 [BDRip 1080p HEVC-10bit FLAC].mkv",
+            ),
+            movie(
+                6,
+                "Hunter X Hunter",
+                "/vol2/1000/media/TV/Anime/Hunter X Hunter/[Kamigami] Hunter X Hunter - 06 [x264 1280x720 AAC Sub(CH,JP)].mkv",
+            ),
+        ]);
+
+        let root = tree.paged_items(None, None, 0, None);
+        let titles = root
+            .items
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(root.total_record_count, 3);
+        assert!(titles.contains(&"Fate Stay Night"));
+        assert!(titles.contains(&"Goblin Slayer"));
+        assert!(titles.contains(&"Hunter X Hunter"));
+
+        let fate = root
+            .items
+            .iter()
+            .find(|item| item.title == "Fate Stay Night")
+            .unwrap();
+        let fate_seasons = tree.paged_items(Some(&fate.id), None, 0, None);
+        let fate_season_numbers = fate_seasons
+            .items
+            .iter()
+            .map(|item| item.season_number)
+            .collect::<Vec<_>>();
+        assert!(fate_season_numbers.contains(&Some(0)));
+        assert!(fate_season_numbers.contains(&Some(1)));
+
+        let specials = fate_seasons
+            .items
+            .iter()
+            .find(|item| item.season_number == Some(0))
+            .unwrap();
+        let special_episodes = tree.paged_items(Some(&specials.id), None, 0, None);
+        assert_eq!(
+            special_episodes.items[0].title,
+            "TV Reproduction 1".to_string()
+        );
     }
 }

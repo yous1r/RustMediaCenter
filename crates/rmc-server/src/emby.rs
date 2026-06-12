@@ -36,6 +36,16 @@ pub fn router() -> Router<AppState> {
         .route("/Users/:user_id/Items", get(user_items))
         .route("/Users/:user_id/Items/Latest", get(latest_items))
         .route("/Users/:user_id/Items/:item_id", get(user_item_detail))
+        .route("/Shows/:series_id/Seasons", get(show_seasons))
+        .route("/Shows/:series_id/Episodes", get(show_episodes))
+        .route(
+            "/Users/:user_id/Shows/:series_id/Seasons",
+            get(user_show_seasons),
+        )
+        .route(
+            "/Users/:user_id/Shows/:series_id/Episodes",
+            get(user_show_episodes),
+        )
         .route("/Items", get(items))
         .route("/Items/:id", get(item_detail))
         .route(
@@ -86,6 +96,22 @@ struct ItemsQuery {
     recursive: Option<bool>,
     #[serde(default, alias = "IncludeItemTypes", alias = "includeItemTypes")]
     include_item_types: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ShowChildrenQuery {
+    #[serde(default, alias = "api_key", alias = "ApiKey")]
+    api_key: Option<String>,
+    #[serde(default, alias = "SeasonId", alias = "seasonId")]
+    season_id: Option<String>,
+    #[serde(default, alias = "StartIndex", alias = "startIndex")]
+    start_index: Option<usize>,
+    #[serde(default, alias = "Limit", alias = "limit")]
+    limit: Option<usize>,
+    #[serde(default, alias = "SortBy", alias = "sortBy")]
+    sort_by: Option<String>,
+    #[serde(default, alias = "SortOrder", alias = "sortOrder")]
+    sort_order: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -441,6 +467,8 @@ fn build_library_item(
     prefix: &str,
     token: Option<&str>,
 ) -> Value {
+    let is_playable = item.play_id.is_some();
+    let is_folder = is_folder_item(&item.kind);
     let image_url = item.poster_url.as_ref().map(|_| {
         let url = absolute_url(
             headers,
@@ -468,10 +496,14 @@ fn build_library_item(
         "PrimaryImageAspectRatio": serde_json::Value::Null,
         "PrimaryImageItemId": item.poster_url.as_ref().map(|_| item.id.clone()),
         "ImagePath": image_url,
-        "CanDownload": item.play_id.is_some(),
+        "CanPlay": is_playable,
+        "CanDownload": is_playable,
+        "PlayAccess": if is_playable { "Full" } else { "None" },
+        "LocationType": if is_playable { "FileSystem" } else { "Virtual" },
         "RecursiveItemCount": item.child_count,
         "ChildCount": item.child_count,
-        "IsFolder": is_folder_item(&item.kind),
+        "IsFolder": is_folder,
+        "IsPlayable": is_playable,
         "Container": serde_json::Value::Null,
         "ParentId": item.parent_id,
         "IndexNumber": item.episode_number.or(item.season_number),
@@ -816,6 +848,111 @@ async fn latest_items(
         .collect::<Vec<_>>();
 
     Ok(Json(Value::Array(items)))
+}
+
+async fn show_seasons(
+    headers: HeaderMap,
+    original_uri: OriginalUri,
+    Query(query): Query<ShowChildrenQuery>,
+    State(db): State<AppState>,
+    Path(series_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = require_auth(&headers, query.api_key.as_deref())?;
+    let prefix = route_prefix(&original_uri.0);
+    let tree = load_media_tree(&db).await?;
+    let mut seasons = tree.paged_items(Some(&series_id), None, 0, None).items;
+    seasons.retain(|item| matches!(item.kind, LibraryItemKind::Season));
+    sort_library_items(
+        &mut seasons,
+        query.sort_by.as_deref(),
+        query.sort_order.as_deref(),
+    );
+
+    let total = seasons.len();
+    let start_index = query.start_index.unwrap_or(0).min(total);
+    let limit = query.limit.unwrap_or(total.saturating_sub(start_index));
+    let items = seasons
+        .into_iter()
+        .skip(start_index)
+        .take(limit)
+        .map(|item| build_library_item(&item, &headers, prefix, Some(&auth.token)))
+        .collect::<Vec<_>>();
+
+    Ok(Json(paged_items_response(items, total, start_index)))
+}
+
+async fn user_show_seasons(
+    headers: HeaderMap,
+    original_uri: OriginalUri,
+    Query(query): Query<ShowChildrenQuery>,
+    State(db): State<AppState>,
+    Path((_user_id, series_id)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    show_seasons(
+        headers,
+        original_uri,
+        Query(query),
+        State(db),
+        Path(series_id),
+    )
+    .await
+}
+
+async fn show_episodes(
+    headers: HeaderMap,
+    original_uri: OriginalUri,
+    Query(query): Query<ShowChildrenQuery>,
+    State(db): State<AppState>,
+    Path(series_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let auth = require_auth(&headers, query.api_key.as_deref())?;
+    let prefix = route_prefix(&original_uri.0);
+    let tree = load_media_tree(&db).await?;
+    let mut episodes = if let Some(season_id) = query
+        .season_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        tree.paged_items(Some(season_id.trim()), None, 0, None)
+            .items
+    } else {
+        recursive_items_for_parent(&tree, Some(&series_id))
+    };
+    episodes.retain(|item| matches!(item.kind, LibraryItemKind::Episode));
+    sort_library_items(
+        &mut episodes,
+        query.sort_by.as_deref(),
+        query.sort_order.as_deref(),
+    );
+
+    let total = episodes.len();
+    let start_index = query.start_index.unwrap_or(0).min(total);
+    let limit = query.limit.unwrap_or(total.saturating_sub(start_index));
+    let items = episodes
+        .into_iter()
+        .skip(start_index)
+        .take(limit)
+        .map(|item| build_library_item(&item, &headers, prefix, Some(&auth.token)))
+        .collect::<Vec<_>>();
+
+    Ok(Json(paged_items_response(items, total, start_index)))
+}
+
+async fn user_show_episodes(
+    headers: HeaderMap,
+    original_uri: OriginalUri,
+    Query(query): Query<ShowChildrenQuery>,
+    State(db): State<AppState>,
+    Path((_user_id, series_id)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    show_episodes(
+        headers,
+        original_uri,
+        Query(query),
+        State(db),
+        Path(series_id),
+    )
+    .await
 }
 
 async fn items(
@@ -1389,10 +1526,54 @@ printf '{"format":{"duration":"187.4"}}\n'
         let episodes_value: Value = serde_json::from_slice(&episodes_body).unwrap();
         assert_eq!(episodes_value["TotalRecordCount"].as_u64(), Some(2));
         assert_eq!(episodes_value["Items"][0]["Type"].as_str(), Some("Episode"));
+        assert_eq!(episodes_value["Items"][0]["CanPlay"].as_bool(), Some(true));
+        assert_eq!(
+            episodes_value["Items"][0]["IsPlayable"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            episodes_value["Items"][0]["PlayAccess"].as_str(),
+            Some("Full")
+        );
+        assert_eq!(
+            episodes_value["Items"][0]["LocationType"].as_str(),
+            Some("FileSystem")
+        );
         let episode_id = episodes_value["Items"][0]["Id"]
             .as_str()
             .unwrap()
             .to_string();
+
+        let detail_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/emby/Users/{}/Items/{}?api_key={}",
+                        VIRTUAL_USER_ID, episode_id, token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_response.status(), 200);
+
+        let detail_body = axum::body::to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail_value: Value = serde_json::from_slice(&detail_body).unwrap();
+        assert_eq!(detail_value["Type"].as_str(), Some("Episode"));
+        assert_eq!(detail_value["CanPlay"].as_bool(), Some(true));
+        assert_eq!(detail_value["IsPlayable"].as_bool(), Some(true));
+        assert_eq!(detail_value["PlayAccess"].as_str(), Some("Full"));
+        assert_eq!(
+            detail_value["MediaSources"][0]["DirectStreamUrl"]
+                .as_str()
+                .map(|value| value.contains("/emby/Videos/episode:")),
+            Some(true)
+        );
 
         let playback_response = app
             .oneshot(
@@ -1419,6 +1600,128 @@ printf '{"format":{"duration":"187.4"}}\n'
             .as_str()
             .unwrap()
             .contains("/emby/Videos/episode:2/original"));
+    }
+
+    #[tokio::test]
+    async fn test_emby_show_seasons_and_episodes_endpoints_drive_series_detail() {
+        let _guard = EnvGuard::set(&[
+            ("RMC_ADMIN_USERNAME", "admin"),
+            ("RMC_ADMIN_PASSWORD", "admin"),
+            ("RMC_JWT_SECRET", "emby-test-secret"),
+        ]);
+        let app = build_app().await;
+        let token = emby_login(app.clone()).await;
+
+        let series_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?ParentId={}&api_key={}",
+                        TVSHOWS_VIEW_ID, token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(series_response.status(), 200);
+
+        let series_body = axum::body::to_bytes(series_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let series_value: Value = serde_json::from_slice(&series_body).unwrap();
+        let series_id = series_value["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Type"].as_str() == Some("Series"))
+            .and_then(|item| item["Id"].as_str())
+            .unwrap()
+            .to_string();
+
+        let seasons_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/emby/Shows/{}/Seasons?api_key={}",
+                        series_id, token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seasons_response.status(), 200);
+
+        let seasons_body = axum::body::to_bytes(seasons_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let seasons_value: Value = serde_json::from_slice(&seasons_body).unwrap();
+        assert_eq!(seasons_value["TotalRecordCount"].as_u64(), Some(1));
+        assert_eq!(seasons_value["Items"][0]["Type"].as_str(), Some("Season"));
+        assert_eq!(seasons_value["Items"][0]["IsFolder"].as_bool(), Some(true));
+        let season_id = seasons_value["Items"][0]["Id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let season_episodes_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/emby/Shows/{}/Episodes?SeasonId={}&api_key={}",
+                        series_id, season_id, token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(season_episodes_response.status(), 200);
+
+        let season_episodes_body =
+            axum::body::to_bytes(season_episodes_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        let season_episodes_value: Value = serde_json::from_slice(&season_episodes_body).unwrap();
+        assert_eq!(season_episodes_value["TotalRecordCount"].as_u64(), Some(2));
+        assert!(season_episodes_value["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| {
+                item["Type"].as_str() == Some("Episode")
+                    && item["CanPlay"].as_bool() == Some(true)
+                    && item["IsPlayable"].as_bool() == Some(true)
+                    && item["PlayAccess"].as_str() == Some("Full")
+            }));
+
+        let all_episodes_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/emby/Users/{}/Shows/{}/Episodes?api_key={}",
+                        VIRTUAL_USER_ID, series_id, token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(all_episodes_response.status(), 200);
+
+        let all_episodes_body = axum::body::to_bytes(all_episodes_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let all_episodes_value: Value = serde_json::from_slice(&all_episodes_body).unwrap();
+        assert_eq!(all_episodes_value["TotalRecordCount"].as_u64(), Some(2));
     }
 
     #[tokio::test]
@@ -1455,6 +1758,9 @@ printf '{"format":{"duration":"187.4"}}\n'
         assert!(tv_value["Items"].as_array().unwrap().iter().all(|item| {
             item["Type"].as_str() == Some("Episode")
                 && item["IsFolder"].as_bool() == Some(false)
+                && item["IsPlayable"].as_bool() == Some(true)
+                && item["CanPlay"].as_bool() == Some(true)
+                && item["PlayAccess"].as_str() == Some("Full")
                 && item["CanDownload"].as_bool() == Some(true)
         }));
 

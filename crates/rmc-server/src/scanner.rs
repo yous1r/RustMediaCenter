@@ -230,19 +230,24 @@ pub fn parse_filename(stem: &str) -> (String, Option<u16>) {
 }
 
 pub(crate) fn derive_title_year_from_path(path: &Path) -> (String, Option<u16>) {
-    let file_stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("Unknown");
+    let file_stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("Unknown");
     let sanitized_stem = strip_release_bracket_suffixes(file_stem);
     let (title, year) = parse_filename(&sanitized_stem);
-    let parent_title = path
-        .parent()
+    let parent_title = title_parent_path(path.parent())
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str())
         .map(parse_filename)
-        .filter(|(parent_title, _)| !parent_title.trim().is_empty() && !title_looks_hash_like(parent_title));
+        .filter(|(parent_title, _)| {
+            !parent_title.trim().is_empty() && !title_looks_hash_like(parent_title)
+        });
 
     match parent_title {
         Some((parent_title, parent_year))
             if file_stem_needs_parent_title(file_stem)
+                || file_stem_has_special_title_marker(file_stem)
                 || should_prefer_parent_title(&title, year, &parent_title, parent_year) =>
         {
             (parent_title, parent_year.or(year))
@@ -253,6 +258,68 @@ pub(crate) fn derive_title_year_from_path(path: &Path) -> (String, Option<u16>) 
 
 fn file_stem_needs_parent_title(file_stem: &str) -> bool {
     title_looks_hash_like(file_stem) || plain_numeric_stem(file_stem).is_some()
+}
+
+fn title_parent_path(mut path: Option<&Path>) -> Option<&Path> {
+    while let Some(current) = path {
+        let segment = current.file_name().and_then(|name| name.to_str())?;
+        if !directory_is_media_group(segment) {
+            return Some(current);
+        }
+        path = current.parent();
+    }
+    None
+}
+
+fn directory_is_media_group(segment: &str) -> bool {
+    let normalized = normalize_token(segment);
+    matches!(
+        normalized.as_str(),
+        "sp" | "sps"
+            | "special"
+            | "specials"
+            | "extras"
+            | "ova"
+            | "ovas"
+            | "oad"
+            | "oads"
+            | "pv"
+            | "pvs"
+            | "preview"
+            | "previews"
+            | "menu"
+            | "menus"
+            | "cd"
+            | "cds"
+            | "ncop"
+            | "nced"
+    ) || season_directory(segment)
+}
+
+fn season_directory(segment: &str) -> bool {
+    static SEASON_DIR_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = SEASON_DIR_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)^\s*(?:season[ ._-]*\d{1,2}|s\d{1,2})\s*$").unwrap()
+    });
+    re.is_match(segment)
+}
+
+fn file_stem_has_special_title_marker(file_stem: &str) -> bool {
+    let normalized = normalize_title_for_comparison(file_stem);
+    [
+        "tv reproduction",
+        "special",
+        "specials",
+        "ova",
+        "oad",
+        "pv",
+        "menu",
+        "menus",
+        "cd",
+        "cds",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn should_prefer_parent_title(
@@ -1006,6 +1073,33 @@ mod tests {
         assert_eq!(
             derive_title_year_from_path(path),
             ("Fate Stay Night".to_string(), Some(2006))
+        );
+    }
+
+    #[test]
+    fn test_derive_title_year_from_path_uses_series_parent_for_special_markers() {
+        let tv_reproduction = Path::new(
+            "/vol2/1000/media/TV/Anime/Fate Stay Night(2006)/[VCB-Studio] Fate Stay Night TV Reproduction [01][Ma10p_1080p][x265_flac].mkv",
+        );
+        assert_eq!(
+            derive_title_year_from_path(tv_reproduction),
+            ("Fate Stay Night".to_string(), Some(2006))
+        );
+
+        let menu = Path::new(
+            "/vol2/1000/media/TV/Anime/Goblin Slayer/Menus/[Nekomoe kissaten] Goblin Slayer Menu 01 [BDRip 1080p HEVC-10bit FLAC].mkv",
+        );
+        assert_eq!(
+            derive_title_year_from_path(menu),
+            ("Goblin Slayer".to_string(), None)
+        );
+
+        let cd = Path::new(
+            "/vol2/1000/media/TV/Anime/Goblin Slayer/CDs/[Nekomoe kissaten] Goblin Slayer CD 02.mkv",
+        );
+        assert_eq!(
+            derive_title_year_from_path(cd),
+            ("Goblin Slayer".to_string(), None)
         );
     }
 }
