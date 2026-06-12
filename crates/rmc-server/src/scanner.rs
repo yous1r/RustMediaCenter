@@ -64,6 +64,18 @@ const TITLE_STOP_TOKENS: &[&str] = &[
     "yify",
     "yts",
 ];
+const LEADING_RELEASE_PREFIXES: &[&str] = &[
+    "ANi",
+    "Kirara Fantasia",
+    "SumiSora&MAGI ATELIER&CASO",
+    "DMG&MH&LoliHouse",
+    "Nekomoe kissaten",
+    "沸班亚马制作组",
+    "天月动漫&发布组",
+    "VCB-Studio",
+    "LoliHouse",
+    "Kamigami",
+];
 
 #[derive(Clone)]
 pub struct MediaScanner {
@@ -122,16 +134,14 @@ impl MediaScanner {
         let mut count = 0u32;
         for file_path in matching_files {
             let path_str = file_path.to_string_lossy().into_owned();
+            let (title, year) = derive_title_year_from_path(&file_path);
+
             if self.db.movie_exists_by_path(&path_str).await? {
+                self.db
+                    .update_movie_title_year_by_path(&path_str, &title, year)
+                    .await?;
                 continue;
             }
-
-            let file_stem = file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unknown");
-
-            let (title, year) = parse_filename(file_stem);
             let file_size = std::fs::metadata(&file_path).map(|m| m.len()).ok();
 
             let movie = Movie {
@@ -157,9 +167,14 @@ impl MediaScanner {
 }
 
 pub fn parse_filename(stem: &str) -> (String, Option<u16>) {
-    let stem = strip_leading_release_groups(stem);
+    let (stem, stripped_release_prefix) = strip_leading_release_groups(stem);
     let bracket_episode_index = bracket_episode_marker(stem).map(|(index, _)| index);
+    let release_suffix_index =
+        release_group_suffix_marker(stem, stripped_release_prefix).map(|(index, _)| index);
     let title_source = bracket_episode_index
+        .into_iter()
+        .chain(release_suffix_index)
+        .min()
         .map(|index| &stem[..index])
         .unwrap_or(stem)
         .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '.' | '_' | '-'));
@@ -168,7 +183,9 @@ pub fn parse_filename(stem: &str) -> (String, Option<u16>) {
         return (title_source.trim().to_string(), None);
     }
 
-    let year_index = if bracket_episode_index.is_some() {
+    let has_explicit_tail_marker =
+        bracket_episode_index.is_some() || release_suffix_index.is_some();
+    let year_index = if has_explicit_tail_marker {
         None
     } else {
         tokens
@@ -212,37 +229,279 @@ pub fn parse_filename(stem: &str) -> (String, Option<u16>) {
     (title, year)
 }
 
-fn strip_leading_release_groups(stem: &str) -> &str {
+pub(crate) fn derive_title_year_from_path(path: &Path) -> (String, Option<u16>) {
+    let file_stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("Unknown");
+    let sanitized_stem = strip_release_bracket_suffixes(file_stem);
+    let (title, year) = parse_filename(&sanitized_stem);
+    let parent_title = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .map(parse_filename)
+        .filter(|(parent_title, _)| !parent_title.trim().is_empty() && !title_looks_hash_like(parent_title));
+
+    match parent_title {
+        Some((parent_title, parent_year))
+            if file_stem_needs_parent_title(file_stem)
+                || should_prefer_parent_title(&title, year, &parent_title, parent_year) =>
+        {
+            (parent_title, parent_year.or(year))
+        }
+        _ => (title, year),
+    }
+}
+
+fn file_stem_needs_parent_title(file_stem: &str) -> bool {
+    title_looks_hash_like(file_stem) || plain_numeric_stem(file_stem).is_some()
+}
+
+fn should_prefer_parent_title(
+    file_title: &str,
+    file_year: Option<u16>,
+    parent_title: &str,
+    parent_year: Option<u16>,
+) -> bool {
+    if parent_title.trim().is_empty() || title_looks_hash_like(parent_title) {
+        return false;
+    }
+
+    let normalized_file_title = normalize_title_for_comparison(file_title);
+    let normalized_parent_title = normalize_title_for_comparison(parent_title);
+
+    if normalized_file_title.is_empty() || normalized_parent_title.is_empty() {
+        return false;
+    }
+
+    if normalized_file_title == normalized_parent_title {
+        return file_year.is_none() && parent_year.is_some();
+    }
+
+    parent_year
+        .and_then(|year| strip_trailing_year_token(file_title, year))
+        .map(|stripped| normalize_title_for_comparison(stripped) == normalized_parent_title)
+        .unwrap_or(false)
+}
+
+fn title_looks_hash_like(title: &str) -> bool {
+    let normalized: String = title
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+
+    let len = normalized.len();
+    len >= 8 && normalized.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn plain_numeric_stem(stem: &str) -> Option<u16> {
+    let trimmed = stem.trim();
+    if trimmed.is_empty() || trimmed.len() > 3 || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    trimmed.parse::<u16>().ok().filter(|value| *value > 0)
+}
+
+pub(crate) fn strip_release_bracket_suffixes(stem: &str) -> String {
+    let mut current = stem.trim().to_string();
+    loop {
+        let Some(open_index) = current.rfind('[') else {
+            return current;
+        };
+        let Some(close_index) = current[open_index..].find(']') else {
+            return current;
+        };
+        if open_index + close_index != current.len() - 1 {
+            return current;
+        }
+        let content = &current[open_index + 1..current.len() - 1];
+        let is_release_suffix = content
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, '_' | '.' | '-'))
+            .filter(|token| !token.is_empty())
+            .any(is_release_tag);
+        if !is_release_suffix {
+            return current;
+        }
+        current = current[..open_index].trim_end().to_string();
+    }
+}
+
+fn strip_leading_release_groups(stem: &str) -> (&str, bool) {
+    let has_bracketed_release_tag = contains_bracketed_release_tag(stem);
     if episode_marker_start(&split_title_tokens(stem)).is_none()
         && bracket_episode_marker(stem).is_none()
+        && release_group_suffix_marker(stem, has_known_release_prefix(stem)).is_none()
+        && !has_bracketed_release_tag
+        && strip_known_release_prefix(stem).is_none()
     {
-        return stem.trim();
+        return (stem.trim(), false);
     }
 
     let mut remaining = stem.trim();
+    let mut stripped_bracket_group = false;
     while let Some(rest) = remaining.strip_prefix('[') {
         let Some(closing_index) = rest.find(']') else {
             break;
         };
+        let content = &rest[..closing_index];
+        if !leading_bracket_group_looks_like_release_metadata(content) {
+            break;
+        }
         let next = rest[closing_index + 1..].trim_start();
         if next.is_empty() {
             break;
         }
         remaining = next;
+        stripped_bracket_group = true;
     }
-    remaining
+
+    if let Some(rest) = strip_known_release_prefix(remaining) {
+        if strip_known_release_prefix(stem).is_some()
+            || episode_marker_start(&split_title_tokens(rest)).is_some()
+            || bracket_episode_marker(rest).is_some()
+            || release_group_suffix_marker(rest, true).is_some()
+            || has_bracketed_release_tag
+        {
+            return (rest, true);
+        }
+    }
+
+    (remaining, stripped_bracket_group)
+}
+
+fn leading_bracket_group_looks_like_release_metadata(content: &str) -> bool {
+    let trimmed = content.trim();
+    !trimmed.is_empty()
+        && (is_known_release_group_name(trimmed)
+            || split_title_tokens(trimmed)
+                .iter()
+                .any(|token| is_release_tag(token)))
 }
 
 pub(crate) fn bracket_episode_marker(stem: &str) -> Option<(usize, u16)> {
     static BRACKET_EPISODE_RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = BRACKET_EPISODE_RE.get_or_init(|| {
-        regex::Regex::new(r"(?:^|[ ._-])(?P<marker>\[(?P<episode>\d{1,3})\])(?:$|\[|[ ._-])")
+        regex::Regex::new(
+            r"(?:^|[\] ._-])(?P<marker>\[(?P<episode>\d{1,3})(?:v\d+)?\])(?:$|\[|[ ._-])",
+        )
             .unwrap()
     });
     let captures = re.captures(stem)?;
     let marker = captures.name("marker")?;
     let episode = captures.name("episode")?.as_str().parse::<u16>().ok()?;
     Some((marker.start(), episode))
+}
+
+pub(crate) fn loose_numbered_episode_suffix(stem: &str) -> Option<(usize, u16)> {
+    static DASHED_EPISODE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = DASHED_EPISODE_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?P<marker>[ ._-]+-\s*(?P<episode>\d{1,3})\s*)$").unwrap()
+    });
+    let captures = re.captures(stem)?;
+    let marker = captures.name("marker")?;
+    let episode = captures.name("episode")?.as_str().parse::<u16>().ok()?;
+    Some((marker.start(), episode))
+}
+
+fn release_group_suffix_marker(
+    stem: &str,
+    allow_plain_number: bool,
+) -> Option<(usize, Option<u16>)> {
+    if let Some((index, episode)) = loose_numbered_episode_suffix(stem) {
+        return Some((index, Some(episode)));
+    }
+
+    if let Some(index) = special_release_suffix_start(stem) {
+        return Some((index, None));
+    }
+
+    if allow_plain_number {
+        if let Some((index, episode)) = plain_numbered_episode_suffix(stem) {
+            return Some((index, Some(episode)));
+        }
+
+        if let Some(index) = trailing_dash_suffix_start(stem) {
+            return Some((index, None));
+        }
+    }
+
+    None
+}
+
+fn plain_numbered_episode_suffix(stem: &str) -> Option<(usize, u16)> {
+    static PLAIN_EPISODE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = PLAIN_EPISODE_RE
+        .get_or_init(|| regex::Regex::new(r"(?P<marker>[ ._-]+(?P<episode>\d{1,3})\s*)$").unwrap());
+    let captures = re.captures(stem)?;
+    let marker = captures.name("marker")?;
+    let episode = captures.name("episode")?.as_str().parse::<u16>().ok()?;
+    Some((marker.start(), episode))
+}
+
+fn special_release_suffix_start(stem: &str) -> Option<usize> {
+    static SPECIAL_SUFFIX_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = SPECIAL_SUFFIX_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(?P<marker>[ ._-]+-\s*(?:(?:cm|ed|op|pv|menu|tvcm)\s*\d{0,3}|nc(?:ed|op)|sunny[ ._-]+day)\s*)$",
+        )
+        .unwrap()
+    });
+    re.captures(stem)
+        .and_then(|captures| captures.name("marker").map(|marker| marker.start()))
+}
+
+fn trailing_dash_suffix_start(stem: &str) -> Option<usize> {
+    static TRAILING_DASH_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re =
+        TRAILING_DASH_RE.get_or_init(|| regex::Regex::new(r"(?P<marker>[ ._-]+-\s*)$").unwrap());
+    re.captures(stem)
+        .and_then(|captures| captures.name("marker").map(|marker| marker.start()))
+}
+
+fn has_known_release_prefix(stem: &str) -> bool {
+    strip_known_release_prefix(stem).is_some()
+}
+
+fn is_known_release_group_name(value: &str) -> bool {
+    let normalized_value = normalize_token(value);
+    LEADING_RELEASE_PREFIXES
+        .iter()
+        .any(|prefix| normalize_token(prefix) == normalized_value)
+}
+
+fn strip_known_release_prefix(stem: &str) -> Option<&str> {
+    let trimmed = stem.trim();
+    LEADING_RELEASE_PREFIXES.iter().find_map(|prefix| {
+        let rest = trimmed.get(prefix.len()..)?;
+        if !trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return None;
+        }
+        rest.chars()
+            .next()
+            .filter(|ch| ch.is_whitespace() || matches!(ch, '-' | '_' | '.'))
+            .map(|_| {
+                rest.trim_start_matches(|ch: char| {
+                    ch.is_whitespace() || matches!(ch, '-' | '_' | '.')
+                })
+            })
+            .filter(|rest| !rest.is_empty())
+    })
+}
+
+fn contains_bracketed_release_tag(stem: &str) -> bool {
+    static BRACKET_CONTENT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re =
+        BRACKET_CONTENT_RE.get_or_init(|| regex::Regex::new(r"\[(?P<content>[^\]]+)\]").unwrap());
+
+    re.captures_iter(stem).any(|captures| {
+        captures
+            .name("content")
+            .map(|content| {
+                split_title_tokens(content.as_str())
+                    .iter()
+                    .any(|token| is_release_tag(token))
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn split_title_tokens(stem: &str) -> Vec<&str> {
@@ -269,6 +528,23 @@ fn normalize_token(token: &str) -> String {
         .filter(|ch| ch.is_alphanumeric())
         .flat_map(|ch| ch.to_lowercase())
         .collect()
+}
+
+fn normalize_title_for_comparison(title: &str) -> String {
+    split_title_tokens(title)
+        .into_iter()
+        .map(normalize_token)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_trailing_year_token<'a>(title: &'a str, year: u16) -> Option<&'a str> {
+    let year_string = year.to_string();
+    let trimmed = title.trim_end();
+    let suffix = trimmed.strip_suffix(&year_string)?;
+    let suffix = suffix.trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, '.' | '_' | '-'));
+    (!suffix.is_empty()).then_some(suffix)
 }
 
 fn episode_marker_start(tokens: &[&str]) -> Option<usize> {
@@ -314,7 +590,7 @@ fn episode_marker_start(tokens: &[&str]) -> Option<usize> {
     None
 }
 
-fn is_release_tag(token: &str) -> bool {
+pub(crate) fn is_release_tag(token: &str) -> bool {
     static RESOLUTION_RE: OnceLock<regex::Regex> = OnceLock::new();
     let normalized = normalize_token(token);
     if normalized.is_empty() {
@@ -379,6 +655,243 @@ mod tests {
         // temp_dir 会在离开作用域时被自动清理
     }
 
+    #[tokio::test]
+    async fn test_media_scanner_updates_existing_dirty_titles() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+        let video_file =
+            temp_path.join("SumiSora&MAGI ATELIER&CASO Fate Zero [x264 1280x720 AAC].mkv");
+        fs::write(&video_file, "mock video content").unwrap();
+
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        db.insert_movie(&Movie {
+            id: 0,
+            title: "SumiSora&MAGI ATELIER&CASO Fate Zero".to_string(),
+            year: None,
+            file_path: video_file.clone(),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            runtime_seconds: None,
+            added_at: 0,
+            file_size: None,
+        })
+        .await
+        .unwrap();
+
+        let scanner = MediaScanner::new(db.clone());
+        let count = scanner
+            .scan_directory(&temp_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let movies = db.get_movies().await.unwrap();
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].title, "Fate Zero");
+    }
+
+    #[tokio::test]
+    async fn test_media_scanner_preserves_existing_year_when_filename_has_none() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+        let video_file = temp_path.join("VCB-Studio Fate Stay Night.mkv");
+        fs::write(&video_file, "mock video content").unwrap();
+
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        db.insert_movie(&Movie {
+            id: 0,
+            title: "VCB-Studio Fate Stay Night".to_string(),
+            year: Some(2006),
+            file_path: video_file.clone(),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            runtime_seconds: None,
+            added_at: 0,
+            file_size: None,
+        })
+        .await
+        .unwrap();
+
+        let scanner = MediaScanner::new(db.clone());
+        let count = scanner
+            .scan_directory(&temp_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let movies = db.get_movies().await.unwrap();
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].title, "Fate Stay Night");
+        assert_eq!(movies[0].year, Some(2006));
+    }
+
+    #[tokio::test]
+    async fn test_media_scanner_inserts_clean_titles_for_release_prefixed_episode_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+        let samples = [
+            (
+                "[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][12][x264_flac](131BE92D).mkv",
+                "Fate Zero",
+            ),
+            (
+                "SumiSora&MAGI ATELIER&CASO Fate Zero.mkv",
+                "Fate Zero",
+            ),
+            (
+                "Kamigami Fate stay night UBW - PV02.mkv",
+                "Fate stay night UBW",
+            ),
+            ("LoliHouse Clevatess - 06.mkv", "Clevatess"),
+            (
+                "DMG&MH&LoliHouse Goblin Slayer - 03.mkv",
+                "Goblin Slayer",
+            ),
+            (
+                "Kamigami Hunter X Hunter - 100.mkv",
+                "Hunter X Hunter",
+            ),
+        ];
+
+        for (filename, _) in &samples {
+            fs::write(temp_path.join(filename), "mock video content").unwrap();
+        }
+
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+
+        let scanner = MediaScanner::new(db.clone());
+        let count = scanner
+            .scan_directory(&temp_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(count, samples.len() as u32);
+
+        let movies = db.get_movies().await.unwrap();
+        assert_eq!(movies.len(), samples.len());
+
+        for (filename, expected_title) in &samples {
+            let file_path = temp_path.join(filename);
+            let movie = movies
+                .iter()
+                .find(|movie| movie.file_path == file_path)
+                .unwrap_or_else(|| panic!("missing movie row for {}", filename));
+            assert_eq!(movie.title, *expected_title, "unexpected title for {}", filename);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_media_scanner_rescan_updates_dirty_titles_for_release_prefixed_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+        let samples = [
+            (
+                "[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][12][x264_flac](131BE92D).mkv",
+                "131BE92D",
+                "Fate Zero",
+            ),
+            (
+                "SumiSora&MAGI ATELIER&CASO Fate Zero.mkv",
+                "SumiSora&MAGI ATELIER&CASO Fate Zero",
+                "Fate Zero",
+            ),
+            (
+                "Kamigami Fate stay night UBW - PV02.mkv",
+                "Kamigami Fate stay night UBW - PV02",
+                "Fate stay night UBW",
+            ),
+            (
+                "LoliHouse Clevatess - 06.mkv",
+                "LoliHouse Clevatess - 06",
+                "Clevatess",
+            ),
+            (
+                "DMG&MH&LoliHouse Goblin Slayer - 03.mkv",
+                "DMG&MH&LoliHouse Goblin Slayer - 03",
+                "Goblin Slayer",
+            ),
+            (
+                "Kamigami Hunter X Hunter - 100.mkv",
+                "Kamigami Hunter X Hunter - 100",
+                "Hunter X Hunter",
+            ),
+        ];
+
+        for (filename, _, _) in &samples {
+            fs::write(temp_path.join(filename), "mock video content").unwrap();
+        }
+
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+
+        for (filename, dirty_title, _) in &samples {
+            db.insert_movie(&Movie {
+                id: 0,
+                title: (*dirty_title).to_string(),
+                year: None,
+                file_path: temp_path.join(filename),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 0,
+                file_size: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let scanner = MediaScanner::new(db.clone());
+        let count = scanner
+            .scan_directory(&temp_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let movies = db.get_movies().await.unwrap();
+        assert_eq!(movies.len(), samples.len());
+
+        for (filename, _, expected_title) in &samples {
+            let file_path = temp_path.join(filename);
+            let movie = movies
+                .iter()
+                .find(|movie| movie.file_path == file_path)
+                .unwrap_or_else(|| panic!("missing movie row for {}", filename));
+            assert_eq!(movie.title, *expected_title, "unexpected title for {}", filename);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_media_scanner_uses_parent_directory_when_file_stem_is_hash_like() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let series_dir = temp_dir.path().join("Fate Zero");
+        fs::create_dir_all(&series_dir).unwrap();
+
+        let video_file = series_dir.join("21162F95.mkv");
+        fs::write(&video_file, "mock video content").unwrap();
+
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+
+        let scanner = MediaScanner::new(db.clone());
+        let count = scanner
+            .scan_directory(&temp_dir.path().to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let movies = db.get_movies().await.unwrap();
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].title, "Fate Zero");
+    }
+
     #[test]
     fn test_parse_filename_edge_cases() {
         assert_eq!(
@@ -428,11 +941,71 @@ mod tests {
             ("Goblin Slayer".to_string(), None)
         );
         assert_eq!(
+            parse_filename("DMG&MH&LoliHouse Goblin Slayer - 03"),
+            ("Goblin Slayer".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("Kamigami Fate stay night UBW - 00"),
+            ("Fate stay night UBW".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("Kamigami Fate stay night UBW - ED01"),
+            ("Fate stay night UBW".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("Kamigami Fate stay night UBW - Menu01"),
+            ("Fate stay night UBW".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("Kamigami Fate stay night UBW - PV02"),
+            ("Fate stay night UBW".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("Kamigami Fate stay night UBW - Sunny Day"),
+            ("Fate stay night UBW".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("Kamigami Hunter X Hunter - 100"),
+            ("Hunter X Hunter".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("SumiSora&MAGI ATELIER&CASO Fate Zero"),
+            ("Fate Zero".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][12][x264_flac](131BE92D)"),
+            ("Fate Zero".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("[Kamigami] Hunter X Hunter [x264 1280x720 AAC MKV Sub(Chs,Jap)]"),
+            ("Hunter X Hunter".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("LoliHouse Clevatess - 10"),
+            ("Clevatess".to_string(), None)
+        );
+        assert_eq!(
+            parse_filename("Nekomoe kissaten Goblin Slayer 12"),
+            ("Goblin Slayer".to_string(), None)
+        );
+        assert_eq!(
             parse_filename("[天月动漫&发布组] 差点在迷宫深处被信任的伙伴杀掉，但靠着天赐技能「无限扭蛋」获得等级9999的伙伴，我要向前队友和世界展开复仇&「给他们好看！」 S01E02"),
             (
                 "差点在迷宫深处被信任的伙伴杀掉，但靠着天赐技能「无限扭蛋」获得等级9999的伙伴，我要向前队友和世界展开复仇&「给他们好看！」".to_string(),
                 None
             )
+        );
+    }
+
+    #[test]
+    fn test_derive_title_year_from_path_prefers_parent_directory_when_filename_only_adds_year() {
+        let path = Path::new(
+            "/vol2/1000/media/TV/Anime/Fate Stay Night(2006)/[VCB-Studio] Fate Stay Night 2006 [01][Ma10p_1080p][x265_flac].mkv",
+        );
+
+        assert_eq!(
+            derive_title_year_from_path(path),
+            ("Fate Stay Night".to_string(), Some(2006))
         );
     }
 }

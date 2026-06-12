@@ -82,6 +82,10 @@ struct ItemsQuery {
     sort_by: Option<String>,
     #[serde(default, alias = "SortOrder", alias = "sortOrder")]
     sort_order: Option<String>,
+    #[serde(default, alias = "Recursive", alias = "recursive")]
+    recursive: Option<bool>,
+    #[serde(default, alias = "IncludeItemTypes", alias = "includeItemTypes")]
+    include_item_types: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,6 +374,67 @@ fn filter_items_for_parent(items: Vec<LibraryItem>, parent_id: Option<&str>) -> 
     }
 }
 
+fn append_recursive_items(
+    tree: &MediaTree,
+    parent_id: Option<&str>,
+    output: &mut Vec<LibraryItem>,
+) {
+    for item in tree.paged_items(parent_id, None, 0, None).items {
+        let child_parent_id = item.id.clone();
+        output.push(item);
+        append_recursive_items(tree, Some(&child_parent_id), output);
+    }
+}
+
+fn recursive_items_for_parent(tree: &MediaTree, parent_id: Option<&str>) -> Vec<LibraryItem> {
+    match parent_id.map(str::trim) {
+        Some(MOVIES_VIEW_ID) => tree
+            .paged_items(None, None, 0, None)
+            .items
+            .into_iter()
+            .filter(|item| matches!(item.kind, LibraryItemKind::Movie))
+            .collect(),
+        Some(TVSHOWS_VIEW_ID) => {
+            let mut items = Vec::new();
+            for series in tree
+                .paged_items(None, None, 0, None)
+                .items
+                .into_iter()
+                .filter(|item| matches!(item.kind, LibraryItemKind::Series))
+            {
+                let series_id = series.id.clone();
+                items.push(series);
+                append_recursive_items(tree, Some(&series_id), &mut items);
+            }
+            items
+        }
+        _ => {
+            let mut items = Vec::new();
+            append_recursive_items(tree, normalize_parent_id(parent_id), &mut items);
+            items
+        }
+    }
+}
+
+fn parse_include_item_types(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn item_matches_include_types(item: &LibraryItem, include_types: &[String]) -> bool {
+    if include_types.is_empty() {
+        return true;
+    }
+
+    let item_type = emby_item_type(&item.kind).to_ascii_lowercase();
+    include_types
+        .iter()
+        .any(|value| value == &item_type || (value == "video" && item.play_id.is_some()))
+}
+
 fn build_library_item(
     item: &LibraryItem,
     headers: &HeaderMap,
@@ -530,6 +595,8 @@ async fn load_library_items(
         } else {
             items
         }
+    } else if query.recursive.unwrap_or(false) {
+        recursive_items_for_parent(&tree, parent_id)
     } else {
         tree.paged_items(
             normalize_parent_id(parent_id),
@@ -540,14 +607,18 @@ async fn load_library_items(
         .items
     };
 
-    items = filter_items_for_parent(items, parent_id);
+    if !query.recursive.unwrap_or(false) {
+        items = filter_items_for_parent(items, parent_id);
+    }
+    let include_types = parse_include_item_types(query.include_item_types.as_deref());
+    items.retain(|item| item_matches_include_types(item, &include_types));
 
     if let Some(search_term) = query
         .search_term
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        if query.ids.is_some() {
+        if query.ids.is_some() || query.recursive.unwrap_or(false) {
             items.retain(|item| matches_search_term(item, search_term));
         }
     }
@@ -1348,6 +1419,106 @@ printf '{"format":{"duration":"187.4"}}\n'
             .as_str()
             .unwrap()
             .contains("/emby/Videos/episode:2/original"));
+    }
+
+    #[tokio::test]
+    async fn test_emby_recursive_items_return_playable_leaf_items() {
+        let _guard = EnvGuard::set(&[
+            ("RMC_ADMIN_USERNAME", "admin"),
+            ("RMC_ADMIN_PASSWORD", "admin"),
+            ("RMC_JWT_SECRET", "emby-test-secret"),
+        ]);
+        let app = build_app().await;
+        let token = emby_login(app.clone()).await;
+
+        let tv_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?ParentId={}&Recursive=true&IncludeItemTypes=Episode&api_key={}",
+                        TVSHOWS_VIEW_ID, token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tv_response.status(), 200);
+
+        let tv_body = axum::body::to_bytes(tv_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tv_value: Value = serde_json::from_slice(&tv_body).unwrap();
+        assert_eq!(tv_value["TotalRecordCount"].as_u64(), Some(2));
+        assert!(tv_value["Items"].as_array().unwrap().iter().all(|item| {
+            item["Type"].as_str() == Some("Episode")
+                && item["IsFolder"].as_bool() == Some(false)
+                && item["CanDownload"].as_bool() == Some(true)
+        }));
+
+        let all_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?Recursive=true&IncludeItemTypes=Movie,Episode&api_key={}",
+                        token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(all_response.status(), 200);
+
+        let all_body = axum::body::to_bytes(all_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let all_value: Value = serde_json::from_slice(&all_body).unwrap();
+        let item_types = all_value["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(all_value["TotalRecordCount"].as_u64(), Some(3));
+        assert!(item_types.contains(&"Movie"));
+        assert_eq!(
+            item_types
+                .iter()
+                .filter(|item_type| **item_type == "Episode")
+                .count(),
+            2
+        );
+
+        let video_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?Recursive=true&IncludeItemTypes=Video&api_key={}",
+                        token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(video_response.status(), 200);
+
+        let video_body = axum::body::to_bytes(video_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let video_value: Value = serde_json::from_slice(&video_body).unwrap();
+        assert_eq!(video_value["TotalRecordCount"].as_u64(), Some(3));
+        assert!(video_value["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["IsFolder"].as_bool() == Some(false)));
     }
 
     #[tokio::test]

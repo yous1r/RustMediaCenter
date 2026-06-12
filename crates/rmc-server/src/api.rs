@@ -16,6 +16,7 @@ use rmc_core::api_types::{
     LibraryItem, LibraryItemsResponse, LibrarySummary, LoginRequest, LoginResponse,
 };
 use rmc_core::models::{Movie, User};
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use tokio_util::io::ReaderStream;
 use tower_http::cors::{Any, CorsLayer};
@@ -309,6 +310,238 @@ pub struct StreamTranscodeQuery {
     pub quality: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct MetadataScrapeJob {
+    title: String,
+    year: Option<u16>,
+    movie_ids: Vec<i64>,
+    stored_titles: Vec<String>,
+}
+
+const TMDB_TITLE_SIMILARITY_THRESHOLD: f64 = 0.85;
+
+fn metadata_scrape_identity(movie: &Movie) -> (String, Option<u16>) {
+    let (parsed_title, parsed_year) = crate::scanner::derive_title_year_from_path(&movie.file_path);
+    let normalized_title = crate::scraper::normalize_query_title(&parsed_title);
+    let fallback_title = crate::scraper::normalize_query_title(&movie.title);
+    let title = if !normalized_title.trim().is_empty() {
+        normalized_title
+    } else if !fallback_title.trim().is_empty() {
+        fallback_title
+    } else {
+        movie.title.clone()
+    };
+    (title, parsed_year.or(movie.year))
+}
+
+fn build_metadata_scrape_jobs(movies: Vec<Movie>) -> Vec<MetadataScrapeJob> {
+    let mut jobs_by_key: BTreeMap<(String, Option<u16>), MetadataScrapeJob> = BTreeMap::new();
+
+    for movie in movies {
+        let (title, year) = metadata_scrape_identity(&movie);
+        let key = (title.clone(), year);
+        let entry = jobs_by_key.entry(key).or_insert_with(|| MetadataScrapeJob {
+            title,
+            year,
+            movie_ids: Vec::new(),
+            stored_titles: Vec::new(),
+        });
+        entry.movie_ids.push(movie.id);
+        entry.stored_titles.push(movie.title);
+    }
+
+    merge_similar_metadata_scrape_jobs(
+        jobs_by_key.into_values().collect(),
+        TMDB_TITLE_SIMILARITY_THRESHOLD,
+    )
+}
+
+fn merge_similar_metadata_scrape_jobs(
+    jobs: Vec<MetadataScrapeJob>,
+    threshold: f64,
+) -> Vec<MetadataScrapeJob> {
+    let mut merged_jobs = Vec::new();
+
+    for job in jobs {
+        if let Some(existing) = merged_jobs
+            .iter_mut()
+            .find(|existing| metadata_scrape_jobs_are_similar(existing, &job, threshold))
+        {
+            merge_metadata_scrape_job(existing, job);
+        } else {
+            merged_jobs.push(job);
+        }
+    }
+
+    merged_jobs
+}
+
+fn metadata_scrape_jobs_are_similar(
+    left: &MetadataScrapeJob,
+    right: &MetadataScrapeJob,
+    threshold: f64,
+) -> bool {
+    if let (Some(left_year), Some(right_year)) = (left.year, right.year) {
+        if left_year != right_year {
+            return false;
+        }
+    }
+
+    titles_are_similar(&left.title, &right.title, threshold)
+}
+
+fn merge_metadata_scrape_job(target: &mut MetadataScrapeJob, source: MetadataScrapeJob) {
+    if preferred_scrape_title(&source.title, &target.title) {
+        target.title = source.title.clone();
+    }
+    if target.year.is_none() {
+        target.year = source.year;
+    }
+    target.movie_ids.extend(source.movie_ids);
+    target.stored_titles.extend(source.stored_titles);
+}
+
+fn titles_are_similar(left: &str, right: &str, threshold: f64) -> bool {
+    let normalized_left = normalize_similarity_title(left);
+    let normalized_right = normalize_similarity_title(right);
+
+    if normalized_left.is_empty() || normalized_right.is_empty() {
+        return false;
+    }
+
+    if normalized_left == normalized_right {
+        return true;
+    }
+
+    if looks_like_distinct_sequel_titles(left, right) {
+        return false;
+    }
+
+    normalized_levenshtein_similarity(&normalized_left, &normalized_right) >= threshold
+}
+
+fn normalize_similarity_title(title: &str) -> String {
+    title
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn normalized_levenshtein_similarity(left: &str, right: &str) -> f64 {
+    let left_chars: Vec<char> = left.chars().collect();
+    let right_chars: Vec<char> = right.chars().collect();
+    let max_len = left_chars.len().max(right_chars.len());
+    if max_len == 0 {
+        return 1.0;
+    }
+
+    let distance = levenshtein_distance(&left_chars, &right_chars);
+    1.0 - (distance as f64 / max_len as f64)
+}
+
+fn levenshtein_distance(left: &[char], right: &[char]) -> usize {
+    if left.is_empty() {
+        return right.len();
+    }
+    if right.is_empty() {
+        return left.len();
+    }
+
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+
+    for (left_index, left_char) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right.iter().enumerate() {
+            let substitution_cost = usize::from(left_char != right_char);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + substitution_cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right.len()]
+}
+
+fn looks_like_distinct_sequel_titles(left: &str, right: &str) -> bool {
+    let left_tokens = similarity_title_tokens(left);
+    let right_tokens = similarity_title_tokens(right);
+
+    match left_tokens.len().cmp(&right_tokens.len()) {
+        std::cmp::Ordering::Less => {
+            right_tokens.starts_with(&left_tokens)
+                && right_tokens
+                    .get(left_tokens.len())
+                    .is_some_and(|token| is_sequel_marker(token))
+                && right_tokens.len() == left_tokens.len() + 1
+        }
+        std::cmp::Ordering::Greater => {
+            left_tokens.starts_with(&right_tokens)
+                && left_tokens
+                    .get(right_tokens.len())
+                    .is_some_and(|token| is_sequel_marker(token))
+                && left_tokens.len() == right_tokens.len() + 1
+        }
+        std::cmp::Ordering::Equal => false,
+    }
+}
+
+fn similarity_title_tokens(title: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for ch in title.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn is_sequel_marker(token: &str) -> bool {
+    token.chars().all(|ch| ch.is_ascii_digit())
+        || matches!(
+            token,
+            "ii" | "iii" | "iv" | "v" | "vi" | "vii" | "viii" | "ix" | "x"
+        )
+}
+
+fn preferred_scrape_title(candidate: &str, current: &str) -> bool {
+    let candidate_noise = title_noise_score(candidate);
+    let current_noise = title_noise_score(current);
+
+    candidate_noise < current_noise
+        || (candidate_noise == current_noise
+            && (title_readability_score(candidate) > title_readability_score(current)
+                || (title_readability_score(candidate) == title_readability_score(current)
+                    && candidate.len() < current.len())))
+}
+
+fn title_readability_score(title: &str) -> usize {
+    similarity_title_tokens(title).len()
+}
+
+fn title_noise_score(title: &str) -> usize {
+    let normalized = crate::scraper::normalize_query_title(title);
+    if normalized.is_empty() {
+        return usize::MAX / 2;
+    }
+
+    title
+        .chars()
+        .count()
+        .saturating_sub(normalized.chars().count())
+}
+
 async fn list_movies(
     State(db): State<AppState>,
     Query(query): Query<MovieQuery>,
@@ -580,49 +813,42 @@ pub async fn trigger_scan(
                 );
                 match db_clone.get_movies_without_metadata().await {
                     Ok(movies) => {
-                        for movie in movies {
-                            let (scrape_title, scrape_year) = movie
-                                .file_path
-                                .file_stem()
-                                .and_then(|stem| stem.to_str())
-                                .map(crate::scanner::parse_filename)
-                                .unwrap_or_else(|| (movie.title.clone(), movie.year));
-                            let scrape_year = scrape_year.or(movie.year);
-
+                        for job in build_metadata_scrape_jobs(movies) {
                             tracing::info!(
-                                movie_id = movie.id,
-                                stored_title = %movie.title,
-                                query_title = %scrape_title,
-                                query_year = ?scrape_year,
-                                "Scraping metadata for movie"
+                                movie_count = job.movie_ids.len(),
+                                stored_titles = ?job.stored_titles,
+                                query_title = %job.title,
+                                query_year = ?job.year,
+                                "Scraping metadata for grouped movies"
                             );
-                            match scraper
-                                .fetch_movie_metadata(&scrape_title, scrape_year)
-                                .await
-                            {
+                            match scraper.fetch_movie_metadata(&job.title, job.year).await {
                                 Ok(metadata) => {
-                                    if let Err(e) = db_clone
-                                        .update_movie_metadata(
-                                            movie.id,
-                                            metadata.poster_url,
-                                            metadata.overview,
-                                            metadata.tmdb_id,
-                                            metadata.runtime_minutes,
-                                        )
-                                        .await
-                                    {
-                                        tracing::error!(
-                                            "Failed to update database metadata for movie {}: {:?}",
-                                            movie.title,
-                                            e
-                                        );
+                                    for movie_id in job.movie_ids {
+                                        if let Err(e) = db_clone
+                                            .update_movie_metadata(
+                                                movie_id,
+                                                metadata.poster_url.clone(),
+                                                metadata.overview.clone(),
+                                                metadata.tmdb_id,
+                                                metadata.runtime_minutes,
+                                            )
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                movie_id,
+                                                query_title = %job.title,
+                                                "Failed to update database metadata: {:?}",
+                                                e
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
-                                        stored_title = %movie.title,
-                                        query_title = %scrape_title,
-                                        query_year = ?scrape_year,
+                                        movie_count = job.movie_ids.len(),
+                                        stored_titles = ?job.stored_titles,
+                                        query_title = %job.title,
+                                        query_year = ?job.year,
                                         "Failed to fetch TMDB metadata: {:?}",
                                         e
                                     );
@@ -1022,6 +1248,241 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 401);
+    }
+
+    #[test]
+    fn test_metadata_scrape_jobs_dedupe_episode_titles_across_seasons() {
+        let movies = vec![
+            Movie {
+                id: 1,
+                title: "Nekomoe kissaten Goblin Slayer 01".to_string(),
+                year: None,
+                file_path: "/media/[Nekomoe kissaten] Goblin Slayer S01E01.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 1,
+                file_size: None,
+            },
+            Movie {
+                id: 2,
+                title: "Nekomoe kissaten Goblin Slayer 12".to_string(),
+                year: None,
+                file_path: "/media/[Nekomoe kissaten] Goblin Slayer S02E12.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 2,
+                file_size: None,
+            },
+        ];
+
+        let jobs = build_metadata_scrape_jobs(movies);
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].title, "Goblin Slayer");
+        assert_eq!(jobs[0].movie_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_metadata_scrape_jobs_dedupe_release_group_dash_episode_titles() {
+        let movies = vec![
+            Movie {
+                id: 1,
+                title: "Kamigami Fate stay night UBW - 00".to_string(),
+                year: None,
+                file_path: "/media/Kamigami Fate stay night UBW - 00.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 1,
+                file_size: None,
+            },
+            Movie {
+                id: 2,
+                title: "Kamigami Fate stay night UBW - 01".to_string(),
+                year: None,
+                file_path: "/media/Kamigami Fate stay night UBW - 01.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 2,
+                file_size: None,
+            },
+            Movie {
+                id: 3,
+                title: "Kamigami Fate stay night UBW - ED01".to_string(),
+                year: None,
+                file_path: "/media/Kamigami Fate stay night UBW - ED01.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 3,
+                file_size: None,
+            },
+        ];
+
+        let jobs = build_metadata_scrape_jobs(movies);
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].title, "Fate stay night UBW");
+        assert_eq!(jobs[0].movie_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_metadata_scrape_jobs_dedupe_similar_titles_over_threshold() {
+        let movies = vec![
+            Movie {
+                id: 1,
+                title: "Goblin Slayer".to_string(),
+                year: None,
+                file_path: "/media/Goblin Slayer - 01.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 1,
+                file_size: None,
+            },
+            Movie {
+                id: 2,
+                title: "GoblinSlayer".to_string(),
+                year: None,
+                file_path: "/media/GoblinSlayer - 02.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 2,
+                file_size: None,
+            },
+        ];
+
+        let jobs = build_metadata_scrape_jobs(movies);
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].title, "Goblin Slayer");
+        assert_eq!(jobs[0].movie_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_metadata_scrape_jobs_keep_distinct_sequel_titles() {
+        let movies = vec![
+            Movie {
+                id: 1,
+                title: "Goblin Slayer".to_string(),
+                year: None,
+                file_path: "/media/Goblin Slayer - 01.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 1,
+                file_size: None,
+            },
+            Movie {
+                id: 2,
+                title: "Goblin Slayer II".to_string(),
+                year: None,
+                file_path: "/media/Goblin Slayer II - 01.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 2,
+                file_size: None,
+            },
+        ];
+
+        let jobs = build_metadata_scrape_jobs(movies);
+
+        assert_eq!(jobs.len(), 2);
+    }
+
+    #[test]
+    fn test_metadata_scrape_jobs_keep_clean_query_title_after_similarity_merge() {
+        let movies = vec![
+            Movie {
+                id: 1,
+                title: "Kamigami Fate stay night UBW - 00".to_string(),
+                year: None,
+                file_path: "/media/Kamigami Fate stay night UBW - 00.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 1,
+                file_size: None,
+            },
+            Movie {
+                id: 2,
+                title: "Kamigami Fate stay night UBW - Menu01".to_string(),
+                year: None,
+                file_path: "/media/Kamigami Fate stay night UBW - Menu01.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 2,
+                file_size: None,
+            },
+            Movie {
+                id: 3,
+                title: "Kamigami Fate stay night UBW - PV01".to_string(),
+                year: None,
+                file_path: "/media/Kamigami Fate stay night UBW - PV01.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 3,
+                file_size: None,
+            },
+        ];
+
+        let jobs = build_metadata_scrape_jobs(movies);
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].title, "Fate stay night UBW");
+    }
+
+    #[test]
+    fn test_metadata_scrape_jobs_use_parent_directory_when_file_stem_is_hash_like() {
+        let movies = vec![Movie {
+            id: 1,
+            title: "21162F95".to_string(),
+            year: None,
+            file_path: "/media/Fate Zero/21162F95.mkv".into(),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            runtime_seconds: None,
+            added_at: 1,
+            file_size: None,
+        }];
+
+        let jobs = build_metadata_scrape_jobs(movies);
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].title, "Fate Zero");
     }
 
     #[tokio::test]

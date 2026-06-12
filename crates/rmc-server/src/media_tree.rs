@@ -20,6 +20,7 @@ pub struct MediaTree {
 struct EpisodeInfo {
     season_number: u16,
     episode_number: u16,
+    title_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,12 +49,8 @@ impl MediaTree {
 
         for movie in movies {
             if let Some(info) = detect_episode_info(&movie) {
-                let (parsed_title, parsed_year) = movie
-                    .file_path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(crate::scanner::parse_filename)
-                    .unwrap_or_else(|| (movie.title.clone(), movie.year));
+                let (parsed_title, parsed_year) =
+                    crate::scanner::derive_title_year_from_path(&movie.file_path);
                 let series_title = if parsed_title.trim().is_empty() {
                     movie.title.clone()
                 } else {
@@ -81,6 +78,7 @@ impl MediaTree {
                     .or_default()
                     .push(EpisodeEntry { movie, info });
             } else {
+                log_series_detection_miss(&movie);
                 movie_count += 1;
                 let item = build_movie_item(&movie);
                 items_by_id.insert(item.id.clone(), item.clone());
@@ -294,7 +292,10 @@ fn build_episode_item(movie: &Movie, parent_id: &str, info: &EpisodeInfo) -> Lib
         id: format!("episode:{}", movie.id),
         kind: LibraryItemKind::Episode,
         parent_id: Some(parent_id.to_string()),
-        title: format!("Episode {}", info.episode_number),
+        title: info
+            .title_override
+            .clone()
+            .unwrap_or_else(|| format!("Episode {}", info.episode_number)),
         year: movie.year,
         poster_url: movie.poster_url.clone(),
         overview: movie.overview.clone(),
@@ -353,27 +354,121 @@ fn slugify(value: &str) -> String {
 
 fn detect_episode_info(movie: &Movie) -> Option<EpisodeInfo> {
     let stem = movie.file_path.file_stem()?.to_str()?;
+    let sanitized_stem = crate::scanner::strip_release_bracket_suffixes(stem);
 
     if let Some(info) = detect_episode_info_in_text(stem) {
         return Some(info);
+    }
+
+    if sanitized_stem != stem {
+        if let Some(info) = detect_episode_info_in_text(&sanitized_stem) {
+            return Some(info);
+        }
     }
 
     if let Some((_, episode_number)) = crate::scanner::bracket_episode_marker(stem) {
         return Some(EpisodeInfo {
             season_number: detect_season_from_ancestors(movie.file_path.parent()).unwrap_or(1),
             episode_number,
+            title_override: None,
         });
+    }
+
+    if sanitized_stem != stem {
+        if let Some((_, episode_number)) = crate::scanner::bracket_episode_marker(&sanitized_stem) {
+            return Some(EpisodeInfo {
+                season_number: detect_season_from_ancestors(movie.file_path.parent()).unwrap_or(1),
+                episode_number,
+                title_override: None,
+            });
+        }
+    }
+
+    if let Some((_, episode_number)) = crate::scanner::loose_numbered_episode_suffix(stem) {
+        return Some(EpisodeInfo {
+            season_number: detect_season_from_ancestors(movie.file_path.parent()).unwrap_or(1),
+            episode_number,
+            title_override: None,
+        });
+    }
+
+    if sanitized_stem != stem {
+        if let Some((_, episode_number)) =
+            crate::scanner::loose_numbered_episode_suffix(&sanitized_stem)
+        {
+            return Some(EpisodeInfo {
+                season_number: detect_season_from_ancestors(movie.file_path.parent()).unwrap_or(1),
+                episode_number,
+                title_override: None,
+            });
+        }
+    }
+
+    if let Some((episode_number, title_override)) = detect_special_marker(&sanitized_stem) {
+        let season_number = detect_season_from_ancestors(movie.file_path.parent())
+            .or_else(|| detect_series_context(movie.file_path.parent()).then_some(0))
+            .unwrap_or(0);
+        return Some(EpisodeInfo {
+            season_number,
+            episode_number,
+            title_override: Some(title_override),
+        });
+    }
+
+    if let Some((episode_number, title_override)) = detect_named_special(&sanitized_stem) {
+        if !detect_series_context(movie.file_path.parent()) {
+            return None;
+        }
+        return Some(EpisodeInfo {
+            season_number: 0,
+            episode_number,
+            title_override: Some(title_override),
+        });
+    }
+
+    if let Some(episode_number) = plain_numeric_episode_number(stem) {
+        let season_number = detect_season_from_ancestors(movie.file_path.parent())
+            .or_else(|| detect_series_context(movie.file_path.parent()).then_some(1))?;
+        return Some(EpisodeInfo {
+            season_number,
+            episode_number,
+            title_override: None,
+        });
+    }
+
+    if sanitized_stem != stem {
+        if let Some(episode_number) = plain_numeric_episode_number(&sanitized_stem) {
+            let season_number = detect_season_from_ancestors(movie.file_path.parent())
+                .or_else(|| detect_series_context(movie.file_path.parent()).then_some(1))?;
+            return Some(EpisodeInfo {
+                season_number,
+                episode_number,
+                title_override: None,
+            });
+        }
     }
 
     let episode_number = episode_only_regex()
         .captures(stem)
         .and_then(|caps| caps.name("episode"))
-        .and_then(|value| value.as_str().parse::<u16>().ok())?;
+        .and_then(|value| value.as_str().parse::<u16>().ok())
+        .or_else(|| {
+            (sanitized_stem != stem)
+                .then(|| {
+                    episode_only_regex()
+                        .captures(&sanitized_stem)
+                        .and_then(|caps| caps.name("episode"))
+                        .and_then(|value| value.as_str().parse::<u16>().ok())
+                })
+                .flatten()
+        })?;
 
-    let season_number = detect_season_from_ancestors(movie.file_path.parent())?;
+    let season_number = detect_season_from_ancestors(movie.file_path.parent())
+        .or_else(|| detect_series_context(movie.file_path.parent()).then_some(1))?;
     Some(EpisodeInfo {
         season_number,
         episode_number,
+        title_override: None,
     })
 }
 
@@ -384,6 +479,7 @@ fn detect_episode_info_in_text(text: &str) -> Option<EpisodeInfo> {
         return Some(EpisodeInfo {
             season_number,
             episode_number,
+            title_override: None,
         });
     }
 
@@ -393,6 +489,7 @@ fn detect_episode_info_in_text(text: &str) -> Option<EpisodeInfo> {
         return Some(EpisodeInfo {
             season_number,
             episode_number,
+            title_override: None,
         });
     }
 
@@ -402,6 +499,9 @@ fn detect_episode_info_in_text(text: &str) -> Option<EpisodeInfo> {
 fn detect_season_from_ancestors(mut path: Option<&Path>) -> Option<u16> {
     while let Some(current) = path {
         let segment = current.file_name()?.to_str()?;
+        if special_season_segment(segment) {
+            return Some(0);
+        }
         if let Some(caps) = season_only_regex().captures(segment) {
             let value = caps
                 .name("season")
@@ -414,6 +514,156 @@ fn detect_season_from_ancestors(mut path: Option<&Path>) -> Option<u16> {
         path = current.parent();
     }
     None
+}
+
+fn special_season_segment(segment: &str) -> bool {
+    let normalized = segment.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "sp" | "sps" | "special" | "specials" | "extras" | "ova" | "ovas" | "oad" | "oads" | "ncop" | "nced"
+    )
+}
+
+fn detect_special_marker(stem: &str) -> Option<(u16, String)> {
+    static BRACKETED_SPECIAL_RE: OnceLock<Regex> = OnceLock::new();
+    static SUFFIX_SPECIAL_RE: OnceLock<Regex> = OnceLock::new();
+
+    let bracketed = BRACKETED_SPECIAL_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:^|[\] ._-])\[(?P<label>ncop|nced|op|ed|pv|cm|menu|tvcm)(?P<episode>\d{0,3})\](?:$|\[|[ ._-])",
+        )
+        .unwrap()
+    });
+    if let Some(caps) = bracketed.captures(stem) {
+        let label = caps.name("label")?.as_str().to_ascii_uppercase();
+        let episode = caps
+            .name("episode")
+            .and_then(|value| (!value.as_str().is_empty()).then_some(value.as_str()))
+            .and_then(|value| value.parse::<u16>().ok());
+        let title = episode
+            .map(|num| format!("{}{}", label, num))
+            .unwrap_or_else(|| label.clone());
+        return Some((special_sort_number(&label, episode), title));
+    }
+
+    let suffix = SUFFIX_SPECIAL_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)[ ._-]+-\s*(?P<label>cm|ed|op|pv|menu|tvcm)(?P<episode>\d{1,3})\s*$",
+        )
+        .unwrap()
+    });
+    let caps = suffix.captures(stem)?;
+    let label = caps.name("label")?.as_str().to_ascii_uppercase();
+    let episode = caps.name("episode")?.as_str().parse::<u16>().ok()?;
+    Some((special_sort_number(&label, Some(episode)), format!("{}{}", label, episode)))
+}
+
+fn detect_named_special(stem: &str) -> Option<(u16, String)> {
+    static SUNNY_DAY_RE: OnceLock<Regex> = OnceLock::new();
+    let sunny_day = SUNNY_DAY_RE
+        .get_or_init(|| Regex::new(r"(?i)[ ._-]+-\s*(sunny[ ._-]+day)\s*$").unwrap());
+    if sunny_day.is_match(stem) {
+        return Some((special_sort_number("SUNNY DAY", None), "Sunny Day".to_string()));
+    }
+    None
+}
+
+fn special_sort_number(label: &str, episode: Option<u16>) -> u16 {
+    let base = match label {
+        "CM" => 100,
+        "TVCM" => 150,
+        "PV" => 200,
+        "MENU" => 250,
+        "OP" | "NCOP" => 300,
+        "ED" | "NCED" => 400,
+        "SUNNY DAY" => 500,
+        _ => 600,
+    };
+    base + episode.unwrap_or(1)
+}
+
+fn plain_numeric_episode_number(stem: &str) -> Option<u16> {
+    let normalized: String = stem.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    if normalized.len() < 1 || normalized.len() > 3 || normalized.len() != stem.trim().len() {
+        return None;
+    }
+
+    normalized.parse::<u16>().ok().filter(|episode| *episode > 0)
+}
+
+fn detect_series_context(path: Option<&Path>) -> bool {
+    let Some(parent) = path else {
+        return false;
+    };
+
+    let candidate = if season_only_segment(parent) {
+        parent.parent()
+    } else {
+        Some(parent)
+    };
+
+    candidate
+        .and_then(|segment| segment.file_name())
+        .and_then(|segment| segment.to_str())
+        .map(|segment| crate::scanner::parse_filename(segment).0)
+        .map(|title| title_has_series_signal(&title))
+        .unwrap_or(false)
+}
+
+fn season_only_segment(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|segment| segment.to_str())
+        .and_then(|segment| season_only_regex().captures(segment))
+        .is_some()
+}
+
+fn title_has_series_signal(title: &str) -> bool {
+    let trimmed = title.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().any(|ch| ch.is_alphabetic())
+        && !trimmed.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn log_series_detection_miss(movie: &Movie) {
+    let path_text = movie.file_path.to_string_lossy();
+    let normalized_path = path_text.to_ascii_lowercase();
+    let path_looks_series = ["/tv/", "/anime/", "/series/"]
+        .iter()
+        .any(|segment| normalized_path.contains(segment));
+
+    if !path_looks_series {
+        return;
+    }
+
+    let stem = movie
+        .file_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let bracket_episode = crate::scanner::bracket_episode_marker(stem).map(|(_, episode)| episode);
+    let dashed_episode =
+        crate::scanner::loose_numbered_episode_suffix(stem).map(|(_, episode)| episode);
+    let plain_numeric = plain_numeric_episode_number(stem);
+    let episode_only = episode_only_regex()
+        .captures(stem)
+        .and_then(|caps| caps.name("episode"))
+        .map(|episode| episode.as_str().to_string());
+    let season_from_path = detect_season_from_ancestors(movie.file_path.parent());
+    let series_context = detect_series_context(movie.file_path.parent());
+
+    tracing::info!(
+        movie_id = movie.id,
+        movie_title = %movie.title,
+        file_path = %path_text,
+        file_stem = %stem,
+        bracket_episode = ?bracket_episode,
+        dashed_episode = ?dashed_episode,
+        plain_numeric = ?plain_numeric,
+        episode_only = ?episode_only,
+        season_from_path = ?season_from_path,
+        series_context,
+        "Series detection miss: item remained a movie despite TV/Anime/Series path"
+    );
 }
 
 fn combined_episode_regex() -> &'static Regex {
@@ -489,6 +739,79 @@ mod tests {
         let info = detect_episode_info(&bracket_movie).unwrap();
         assert_eq!(info.season_number, 1);
         assert_eq!(info.episode_number, 1);
+
+        let dashed_movie = movie(
+            4,
+            "Fate stay night UBW",
+            "/media/Fate stay night UBW/Kamigami Fate stay night UBW - 03.mkv",
+        );
+        let info = detect_episode_info(&dashed_movie).unwrap();
+        assert_eq!(info.season_number, 1);
+        assert_eq!(info.episode_number, 3);
+
+        let numeric_movie = movie(5, "Tiny World", "/media/Tiny World/Season 1/01.mkv");
+        let info = detect_episode_info(&numeric_movie).unwrap();
+        assert_eq!(info.season_number, 1);
+        assert_eq!(info.episode_number, 1);
+
+        let default_season_movie = movie(6, "Tiny World", "/media/Tiny World/EP03.mkv");
+        let info = detect_episode_info(&default_season_movie).unwrap();
+        assert_eq!(info.season_number, 1);
+        assert_eq!(info.episode_number, 3);
+
+        let release_tail_movie = movie(
+            7,
+            "Clevatess",
+            "/media/Clevatess/Season 1/[LoliHouse] Clevatess - 05 [WebRip 1080p HEVC-10bit AAC ASSx2].mkv",
+        );
+        let info = detect_episode_info(&release_tail_movie).unwrap();
+        assert_eq!(info.season_number, 1);
+        assert_eq!(info.episode_number, 5);
+
+        let special_suffix_movie = movie(
+            8,
+            "Fate stay night UBW - ED04",
+            "/media/TV/Anime/Fate stay night UBW/[Kamigami] Fate stay night UBW - ED04 [1080p x265 Ma10p FLAC].mkv",
+        );
+        let info = detect_episode_info(&special_suffix_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 404);
+
+        let bracketed_release_episode_movie = movie(
+            9,
+            "Fate Zero",
+            "/media/Fate Zero/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][14][x264_flac](9CF3C185).mkv",
+        );
+        let info = detect_episode_info(&bracketed_release_episode_movie).unwrap();
+        assert_eq!(info.season_number, 1);
+        assert_eq!(info.episode_number, 14);
+
+        let bracketed_special_episode_movie = movie(
+            10,
+            "Fate Stay Night 2006",
+            "/media/TV/Anime/Fate Stay Night(2006)/SPs/[VCB-Studio] Fate Stay Night 2006 [PV02][Ma10p_1080p][x265_flac].mkv",
+        );
+        let info = detect_episode_info(&bracketed_special_episode_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 202);
+
+        let named_special_movie = movie(
+            11,
+            "Fate stay night UBW",
+            "/media/TV/Anime/Fate stay night UBW/[Kamigami] Fate stay night UBW - Sunny Day [1080p x265 Ma10p FLAC].mkv",
+        );
+        let info = detect_episode_info(&named_special_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 501);
+
+        let versioned_episode_movie = movie(
+            12,
+            "Fate Stay Night 2006",
+            "/media/TV/Anime/Fate Stay Night(2006)/[VCB-Studio] Fate Stay Night 2006 [13v2][Ma10p_1080p][x265_flac].mkv",
+        );
+        let info = detect_episode_info(&versioned_episode_movie).unwrap();
+        assert_eq!(info.season_number, 1);
+        assert_eq!(info.episode_number, 13);
     }
 
     #[test]
@@ -520,6 +843,110 @@ mod tests {
         let episodes = tree.paged_items(Some(&seasons.items[0].id), None, 0, None);
         assert_eq!(episodes.total_record_count, 2);
         assert_eq!(episodes.items[0].play_id, Some(1));
+    }
+
+    #[test]
+    fn test_media_tree_groups_numeric_episode_files_under_series_folder() {
+        let tree = MediaTree::from_movies(vec![
+            movie(1, "Tiny World", "/media/Tiny World/01.mkv"),
+            movie(2, "Tiny World", "/media/Tiny World/02.mkv"),
+            movie(3, "Inception", "/media/Inception.2010.mkv"),
+        ]);
+
+        let root = tree.paged_items(None, None, 0, None);
+        assert_eq!(root.total_record_count, 2);
+
+        let series = root
+            .items
+            .iter()
+            .find(|item| item.kind == LibraryItemKind::Series)
+            .unwrap();
+        let seasons = tree.paged_items(Some(&series.id), None, 0, None);
+        assert_eq!(seasons.total_record_count, 1);
+        let episodes = tree.paged_items(Some(&seasons.items[0].id), None, 0, None);
+        assert_eq!(episodes.total_record_count, 2);
+        assert_eq!(episodes.items[0].episode_number, Some(1));
+        assert_eq!(episodes.items[1].episode_number, Some(2));
+    }
+
+    #[test]
+    fn test_media_tree_groups_release_tagged_numbered_episodes() {
+        let tree = MediaTree::from_movies(vec![
+            movie(
+                1,
+                "Clevatess - 05",
+                "/media/Clevatess/Season 1/[LoliHouse] Clevatess - 05 [WebRip 1080p HEVC-10bit AAC ASSx2].mkv",
+            ),
+            movie(
+                2,
+                "Clevatess - 06",
+                "/media/Clevatess/Season 1/[LoliHouse] Clevatess - 06 [WebRip 1080p HEVC-10bit AAC ASSx2].mkv",
+            ),
+        ]);
+
+        let root = tree.paged_items(None, None, 0, None);
+        assert_eq!(root.total_record_count, 1);
+        assert_eq!(root.items[0].kind, LibraryItemKind::Series);
+    }
+
+    #[test]
+    fn test_media_tree_groups_special_suffix_anime_entries_into_series() {
+        let tree = MediaTree::from_movies(vec![movie(
+            1,
+            "Fate stay night UBW - ED04",
+            "/media/TV/Anime/Fate stay night UBW/[Kamigami] Fate stay night UBW - ED04 [1080p x265 Ma10p FLAC].mkv",
+        )]);
+
+        let root = tree.paged_items(None, None, 0, None);
+        assert_eq!(root.total_record_count, 1);
+        assert_eq!(root.items[0].kind, LibraryItemKind::Series);
+
+        let seasons = tree.paged_items(Some(&root.items[0].id), None, 0, None);
+        assert_eq!(seasons.total_record_count, 1);
+        assert_eq!(seasons.items[0].season_number, Some(0));
+    }
+
+    #[test]
+    fn test_media_tree_groups_bracketed_release_episode_entries() {
+        let tree = MediaTree::from_movies(vec![movie(
+            1,
+            "Fate Zero",
+            "/media/TV/Anime/Fate Zero/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][14][x264_flac](9CF3C185).mkv",
+        )]);
+
+        let root = tree.paged_items(None, None, 0, None);
+        assert_eq!(root.total_record_count, 1);
+        assert_eq!(root.items[0].kind, LibraryItemKind::Series);
+    }
+
+    #[test]
+    fn test_media_tree_groups_bracketed_special_episode_entries() {
+        let tree = MediaTree::from_movies(vec![movie(
+            1,
+            "VCB-Studio Fate Stay Night",
+            "/media/TV/Anime/Fate Stay Night(2006)/SPs/[VCB-Studio] Fate Stay Night 2006 [PV02][Ma10p_1080p][x265_flac].mkv",
+        )]);
+
+        let root = tree.paged_items(None, None, 0, None);
+        assert_eq!(root.total_record_count, 1);
+        assert_eq!(root.items[0].kind, LibraryItemKind::Series);
+        let seasons = tree.paged_items(Some(&root.items[0].id), None, 0, None);
+        assert_eq!(seasons.items[0].season_number, Some(0));
+    }
+
+    #[test]
+    fn test_media_tree_groups_named_special_entries() {
+        let tree = MediaTree::from_movies(vec![movie(
+            1,
+            "Fate stay night UBW",
+            "/media/TV/Anime/Fate stay night UBW/[Kamigami] Fate stay night UBW - Sunny Day [1080p x265 Ma10p FLAC].mkv",
+        )]);
+
+        let root = tree.paged_items(None, None, 0, None);
+        assert_eq!(root.total_record_count, 1);
+        assert_eq!(root.items[0].kind, LibraryItemKind::Series);
+        let seasons = tree.paged_items(Some(&root.items[0].id), None, 0, None);
+        assert_eq!(seasons.items[0].season_number, Some(0));
     }
 
     #[test]

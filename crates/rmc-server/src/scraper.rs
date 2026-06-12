@@ -1,8 +1,21 @@
 use rmc_core::models::Movie;
 use serde::Deserialize;
+use std::sync::OnceLock;
 
 const TMDB_API_URL: &str = "https://api.themoviedb.org/3/search/movie";
 const TMDB_IMAGE_BASE: &str = "https://image.tmdb.org/t/p/w500";
+const QUERY_RELEASE_PREFIXES: &[&str] = &[
+    "DMG&MH&LoliHouse",
+    "Nekomoe kissaten",
+    "SumiSora&MAGI ATELIER&CASO",
+    "Kirara Fantasia",
+    "VCB-Studio",
+    "LoliHouse",
+    "Kamigami",
+    "ANi",
+    "沸班亚马制作组",
+    "天月动漫&发布组",
+];
 
 pub struct TmdbScraper {
     api_key: String,
@@ -185,9 +198,84 @@ fn push_query_candidate(
     }
 }
 
-fn normalize_query_title(title: &str) -> String {
-    let (normalized_title, _) = crate::scanner::parse_filename(title);
-    normalized_title.trim().to_string()
+pub(crate) fn normalize_query_title(title: &str) -> String {
+    let raw_title = title.trim();
+    let prefix_stripped = strip_known_query_prefix(raw_title);
+    let (parsed_title, _) = crate::scanner::parse_filename(prefix_stripped);
+
+    let mut normalized = strip_known_query_prefix(parsed_title.trim()).to_string();
+    normalized = strip_query_suffix_noise(&normalized);
+    normalized = strip_catalog_prefix(&normalized);
+    normalized = strip_query_suffix_noise(&normalized);
+
+    normalized
+        .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '.' | '_' | '-'))
+        .to_string()
+}
+
+fn strip_known_query_prefix(title: &str) -> &str {
+    let trimmed = title.trim();
+    for prefix in QUERY_RELEASE_PREFIXES {
+        let Some(rest) = trimmed.get(prefix.len()..) else {
+            continue;
+        };
+        if trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && rest
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '-' | '_' | '.'))
+        {
+            return rest.trim_start_matches(|ch: char| {
+                ch.is_whitespace() || matches!(ch, '-' | '_' | '.')
+            });
+        }
+    }
+    trimmed
+}
+
+fn strip_query_suffix_noise(title: &str) -> String {
+    static TRAILING_QUERY_NOISE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = TRAILING_QUERY_NOISE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?ix)
+            (?P<suffix>
+                [ ._-]*
+                (?:
+                    ma\d+p
+                    |(?:cm|ed|op|pv|menu|tvcm)\s*\d{0,3}
+                    |nc(?:ed|op)
+                    |preview
+                    |tv\s+reproduction
+                    |sunny\s+day
+                    |live\s*\d*
+                    |mv(?:\s+making\s+video)?
+                    |music\s+video
+                    |making\s+video
+                    |animation\s+music\s+video
+                    |artist\s+visual(?:\s+satsuei)?(?:\s+making\s+video)?
+                    |satsuei(?:\s+making\s+video)?
+                )
+            )$
+            ",
+        )
+        .unwrap()
+    });
+
+    let mut current = title.trim().to_string();
+    loop {
+        let next = re.replace(&current, "").trim().to_string();
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
+fn strip_catalog_prefix(title: &str) -> String {
+    static CATALOG_PREFIX_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = CATALOG_PREFIX_RE
+        .get_or_init(|| regex::Regex::new(r"(?i)^(?:[a-z]{2,8}[ -_]?\d{3,6}[ ._-]+)+").unwrap());
+    re.replace(title.trim(), "").trim().to_string()
 }
 
 #[cfg(test)]
@@ -203,6 +291,18 @@ mod tests {
         assert_eq!(
             normalize_query_title("Tiny.World.S01E04.HDR.2160p.WEB.h265-KOGi"),
             "Tiny World"
+        );
+        assert_eq!(
+            normalize_query_title("VCB-Studio Fate Stay Night"),
+            "Fate Stay Night"
+        );
+        assert_eq!(
+            normalize_query_title("SumiSora&MAGI ATELIER&CASO Fate Zero"),
+            "Fate Zero"
+        );
+        assert_eq!(
+            normalize_query_title("Nekomoe kissaten Goblin Slayer PV 01"),
+            "Goblin Slayer"
         );
         assert_eq!(normalize_query_title("Inception"), "Inception");
     }

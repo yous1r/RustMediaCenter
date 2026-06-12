@@ -116,6 +116,7 @@ mod tests {
             tmdb_id: None,
             runtime_minutes: None,
             runtime_seconds: None,
+            episode_number: None,
             added_at: 0,
             file_size: None,
         }];

@@ -122,6 +122,21 @@ impl Database {
         Ok(rec.is_some())
     }
 
+    pub async fn update_movie_title_year_by_path(
+        &self,
+        path: &str,
+        title: &str,
+        year: Option<u16>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE movies SET title = ?, year = COALESCE(?, year) WHERE file_path = ?")
+            .bind(title)
+            .bind(year.map(|value| value as i32))
+            .bind(path)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_movie_by_id(&self, id: i64) -> Result<Movie, sqlx::Error> {
         let r = sqlx::query("SELECT id, title, year, file_path, poster_url, overview, tmdb_id, runtime_minutes, runtime_seconds, added_at, file_size FROM movies WHERE id = ?")
             .bind(id)
@@ -395,6 +410,66 @@ mod tests {
         db.delete_movie(movie_id).await.unwrap();
         let count_after_delete = db.get_movie_count().await.unwrap();
         assert_eq!(count_after_delete, 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_movie_title_year_by_path() {
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+
+        let movie = Movie {
+            id: 0,
+            title: "Dirty Title".to_string(),
+            year: None,
+            file_path: std::path::PathBuf::from("/media/fate-zero.mkv"),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            runtime_seconds: None,
+            added_at: 0,
+            file_size: None,
+        };
+
+        db.insert_movie(&movie).await.unwrap();
+        db.update_movie_title_year_by_path("/media/fate-zero.mkv", "Fate Zero", Some(2011))
+            .await
+            .unwrap();
+
+        let movies = db.get_movies().await.unwrap();
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].title, "Fate Zero");
+        assert_eq!(movies[0].year, Some(2011));
+    }
+
+    #[tokio::test]
+    async fn test_update_movie_title_year_by_path_preserves_existing_year_when_missing() {
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+
+        let movie = Movie {
+            id: 0,
+            title: "Dirty Title".to_string(),
+            year: Some(2006),
+            file_path: std::path::PathBuf::from("/media/fate-stay-night.mkv"),
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            runtime_seconds: None,
+            added_at: 0,
+            file_size: None,
+        };
+
+        db.insert_movie(&movie).await.unwrap();
+        db.update_movie_title_year_by_path("/media/fate-stay-night.mkv", "Fate Stay Night", None)
+            .await
+            .unwrap();
+
+        let movies = db.get_movies().await.unwrap();
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].title, "Fate Stay Night");
+        assert_eq!(movies[0].year, Some(2006));
     }
 
     #[tokio::test]
