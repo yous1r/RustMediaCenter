@@ -70,6 +70,18 @@ async fn resolve_probe_input(file_path: &Path) -> Result<(String, Option<String>
     }
 }
 
+fn is_http_input(input: &str) -> bool {
+    input.starts_with("http://") || input.starts_with("https://")
+}
+
+fn headers_contain(headers: Option<&str>, header_name: &str) -> bool {
+    headers
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim()))
+        .any(|name| name.eq_ignore_ascii_case(header_name))
+}
+
 async fn probe_duration_seconds(input: &str, headers: Option<&str>) -> Result<u32, anyhow::Error> {
     let mut command = Command::new(ffprobe_cmd());
     command
@@ -83,6 +95,21 @@ async fn probe_duration_seconds(input: &str, headers: Option<&str>) -> Result<u3
         .arg("format=duration")
         .arg("-of")
         .arg("json");
+
+    if is_http_input(input) {
+        command
+            .arg("-seekable")
+            .arg("0")
+            .arg("-icy")
+            .arg("0")
+            .arg("-multiple_requests")
+            .arg("1");
+        if !headers_contain(headers, "user-agent") {
+            command
+                .arg("-user_agent")
+                .arg(crate::strm::DEFAULT_REMOTE_USER_AGENT);
+        }
+    }
 
     if let Some(headers) = headers.filter(|value| !value.trim().is_empty()) {
         command.arg("-headers").arg(headers);
@@ -169,6 +196,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     static ENV_MUTEX: StdMutex<()> = StdMutex::new(());
 
@@ -222,6 +251,37 @@ printf '{"format":{"duration":"187.4"}}\n'
         perms.set_mode(0o755);
         std::fs::set_permissions(&script_path, perms).unwrap();
         script_path
+    }
+
+    async fn spawn_redirect_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0; 4096];
+                let Ok(read_len) = socket.read(&mut buffer).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read_len]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default();
+                let response = if path.starts_with("/play/") {
+                    "HTTP/1.1 302 Found\r\nlocation: /cdn/movie.mkv\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-type: video/x-matroska\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        format!("http://{}", addr)
     }
 
     #[tokio::test]
@@ -305,5 +365,69 @@ printf '{"format":{"duration":"187.4"}}\n'
         assert!(log.contains("User-Agent: VidHub"));
         assert!(log.contains("Referer: https://example.com"));
         assert!(log.contains("https://example.com/movie.mkv"));
+    }
+
+    #[tokio::test]
+    async fn test_ensure_movie_runtime_seconds_passes_http_input_options_before_strm_url() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ffprobe_path = write_fake_ffprobe(&temp_dir);
+        let log_path = temp_dir.path().join("ffprobe.log");
+        let strm_path = temp_dir.path().join("movie.strm");
+        let source_base = spawn_redirect_server().await;
+        let source_url = format!("{}/play/movie.mkv", source_base);
+        let resolved_url = format!("{}/cdn/movie.mkv", source_base);
+        std::fs::write(&strm_path, &source_url).unwrap();
+
+        let _guard = EnvGuard::set(&[
+            (
+                "RMC_FFPROBE_CMD",
+                ffprobe_path.to_string_lossy().into_owned(),
+            ),
+            ("RMC_FFPROBE_LOG", log_path.to_string_lossy().into_owned()),
+        ]);
+
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+        db.insert_movie(&Movie {
+            id: 1,
+            title: "Movie".to_string(),
+            year: Some(2024),
+            file_path: strm_path,
+            poster_url: None,
+            overview: None,
+            tmdb_id: None,
+            runtime_minutes: None,
+            runtime_seconds: None,
+            added_at: 0,
+            file_size: None,
+        })
+        .await
+        .unwrap();
+
+        let movie = ensure_movie_runtime_seconds(&db, 1).await.unwrap();
+        let log = std::fs::read_to_string(log_path).unwrap();
+
+        assert_eq!(movie.runtime_seconds, Some(187));
+        assert!(log.contains(&source_url));
+        assert!(!log.contains(&resolved_url));
+
+        let args = log.lines().collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["-seekable", "0"]));
+        assert!(args.windows(2).any(|pair| pair == ["-icy", "0"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-multiple_requests", "1"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-user_agent", "curl/8.0.1"]));
+        let input_index = args
+            .iter()
+            .position(|arg| *arg == source_url)
+            .expect("missing source url");
+        let user_agent_index = args
+            .iter()
+            .position(|arg| *arg == "-user_agent")
+            .expect("missing user agent option");
+        assert!(user_agent_index < input_index);
     }
 }

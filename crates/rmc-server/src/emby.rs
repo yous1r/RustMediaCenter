@@ -1057,10 +1057,11 @@ async fn playback_info(
     })))
 }
 
-fn redirect_to_api_path(path: &str) -> Result<Response, AppError> {
+fn redirect_to_api_path(headers: &HeaderMap, path: &str) -> Result<Response, AppError> {
+    let location = absolute_url(headers, "", path);
     Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
-        .header(header::LOCATION, path)
+        .header(header::LOCATION, location)
         .body(axum::body::Body::empty())
         .map_err(|err| AppError::Internal(err.into()))
 }
@@ -1073,7 +1074,7 @@ async fn video_original(
 ) -> Result<Response, AppError> {
     let _auth = require_auth(&headers, query.api_key.as_deref())?;
     let movie_id = get_playable_movie_id(&db, &id).await?;
-    redirect_to_api_path(&format!("/api/v1/movies/{}/direct", movie_id))
+    redirect_to_api_path(&headers, &format!("/api/v1/movies/{}/direct", movie_id))
 }
 
 async fn video_stream(
@@ -1084,7 +1085,7 @@ async fn video_stream(
 ) -> Result<Response, AppError> {
     let _auth = require_auth(&headers, query.api_key.as_deref())?;
     let movie_id = get_playable_movie_id(&db, &id).await?;
-    redirect_to_api_path(&format!("/api/v1/movies/{}/direct", movie_id))
+    redirect_to_api_path(&headers, &format!("/api/v1/movies/{}/direct", movie_id))
 }
 
 async fn video_stream_mp4(
@@ -1095,7 +1096,7 @@ async fn video_stream_mp4(
 ) -> Result<Response, AppError> {
     let _auth = require_auth(&headers, query.api_key.as_deref())?;
     let movie_id = get_playable_movie_id(&db, &id).await?;
-    redirect_to_api_path(&format!("/api/v1/movies/{}/stream.mp4", movie_id))
+    redirect_to_api_path(&headers, &format!("/api/v1/movies/{}/stream.mp4", movie_id))
 }
 
 async fn video_hls_playlist(
@@ -1106,7 +1107,10 @@ async fn video_hls_playlist(
 ) -> Result<Response, AppError> {
     let _auth = require_auth(&headers, query.api_key.as_deref())?;
     let movie_id = get_playable_movie_id(&db, &id).await?;
-    redirect_to_api_path(&format!("/api/v1/movies/{}/hls/master.m3u8", movie_id))
+    redirect_to_api_path(
+        &headers,
+        &format!("/api/v1/movies/{}/hls/master.m3u8", movie_id),
+    )
 }
 
 async fn report_playing(
@@ -1865,6 +1869,61 @@ printf '{"format":{"duration":"187.4"}}\n'
             .unwrap()
             .contains("/emby/Videos/1/stream.mp4"));
         assert_eq!(media_source["RunTimeTicks"].as_u64(), Some(98_400_000_000));
+    }
+
+    #[tokio::test]
+    async fn test_video_original_redirects_episode_to_absolute_api_url() {
+        let _guard = EnvGuard::set(&[
+            ("RMC_ADMIN_USERNAME", "admin"),
+            ("RMC_ADMIN_PASSWORD", "admin"),
+            ("RMC_JWT_SECRET", "emby-test-secret"),
+        ]);
+        let app = build_app().await;
+        let token = emby_login(app.clone()).await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/emby/Videos/episode:2/original?api_key={}", token))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://media.test/api/v1/movies/2/direct")
+        );
+
+        let encoded_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/emby/Videos/episode%3A2/original?api_key={}",
+                        token
+                    ))
+                    .header("host", "media.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(encoded_response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            encoded_response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://media.test/api/v1/movies/2/direct")
+        );
     }
 
     #[tokio::test]

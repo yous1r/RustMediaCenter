@@ -50,7 +50,7 @@ impl MediaTree {
         for movie in movies {
             if let Some(info) = detect_episode_info(&movie) {
                 let (parsed_title, parsed_year) =
-                    crate::scanner::derive_title_year_from_path(&movie.file_path);
+                    episode_series_title_year(&movie.file_path, &info);
                 let series_title = if parsed_title.trim().is_empty() {
                     movie.title.clone()
                 } else {
@@ -267,6 +267,36 @@ impl MediaTree {
     }
 }
 
+fn episode_series_title_year(path: &Path, info: &EpisodeInfo) -> (String, Option<u16>) {
+    if info.season_number == 0 {
+        if let Some(value) = series_title_year_from_special_context(path.parent()) {
+            return value;
+        }
+    }
+
+    crate::scanner::derive_title_year_from_path(path)
+}
+
+fn series_title_year_from_special_context(
+    mut path: Option<&Path>,
+) -> Option<(String, Option<u16>)> {
+    while let Some(current) = path {
+        let segment = current.file_name()?.to_str()?;
+        if special_context_label(segment).is_some() {
+            let parent = current.parent()?;
+            let parent_name = parent.file_name()?.to_str()?;
+            let (title, year) = crate::scanner::parse_filename(parent_name);
+            if !title.trim().is_empty() && title_has_series_signal(&title) {
+                return Some((title, year));
+            }
+            return None;
+        }
+        path = current.parent();
+    }
+
+    None
+}
+
 fn build_movie_item(movie: &Movie) -> LibraryItem {
     LibraryItem {
         id: movie.id.to_string(),
@@ -434,6 +464,18 @@ fn detect_episode_info(movie: &Movie) -> Option<EpisodeInfo> {
         }
     }
 
+    if let Some(info) = detect_contextual_trailing_number_episode(movie.file_path.parent(), stem) {
+        return Some(info);
+    }
+
+    if sanitized_stem != stem {
+        if let Some(info) =
+            detect_contextual_trailing_number_episode(movie.file_path.parent(), &sanitized_stem)
+        {
+            return Some(info);
+        }
+    }
+
     if let Some((episode_number, title_override)) = detect_special_marker(&sanitized_stem) {
         let season_number = detect_season_from_ancestors(movie.file_path.parent())
             .or_else(|| detect_series_context(movie.file_path.parent()).then_some(0))
@@ -526,6 +568,21 @@ fn detect_episode_info_in_text(text: &str) -> Option<EpisodeInfo> {
     None
 }
 
+fn detect_contextual_trailing_number_episode(
+    path: Option<&Path>,
+    stem: &str,
+) -> Option<EpisodeInfo> {
+    let episode_number = trailing_plain_number(stem)?;
+    let season_number =
+        detect_season_from_ancestors(path).or_else(|| detect_series_context(path).then_some(1))?;
+
+    Some(EpisodeInfo {
+        season_number,
+        episode_number,
+        title_override: None,
+    })
+}
+
 fn detect_season_from_ancestors(mut path: Option<&Path>) -> Option<u16> {
     while let Some(current) = path {
         let segment = current.file_name()?.to_str()?;
@@ -573,6 +630,7 @@ fn special_context_label(segment: &str) -> Option<String> {
     let label = match normalized.as_str() {
         "sp" | "sps" | "special" | "specials" | "extras" => "Special",
         "ova" | "ovas" | "oad" | "oads" => "OVA",
+        "cm" | "cms" => "CM",
         "pv" | "pvs" | "preview" | "previews" => "PV",
         "menu" | "menus" => "Menu",
         "cd" | "cds" => "CD",
@@ -591,9 +649,13 @@ fn detect_special_marker(stem: &str) -> Option<(u16, String)> {
     static BRACKETED_SPECIAL_RE: OnceLock<Regex> = OnceLock::new();
     static SUFFIX_SPECIAL_RE: OnceLock<Regex> = OnceLock::new();
 
+    if let Some((episode_number, title)) = detect_season_remix_special(stem) {
+        return Some((episode_number, title));
+    }
+
     let bracketed = BRACKETED_SPECIAL_RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:^|[\] ._-])\[(?P<label>ncop|nced|op|ed|pv|cm|menu|tvcm)(?P<episode>\d{0,3})\](?:$|\[|[ ._-])",
+            r"(?i)(?:^|[\] ._-])\[(?P<label>special|sp|ncop|nced|op|ed|pv|bdcm|psvcm|tvcm|cm|menu)(?P<episode>\d{0,3})\](?:$|\[|[ ._-])",
         )
         .unwrap()
     });
@@ -603,23 +665,54 @@ fn detect_special_marker(stem: &str) -> Option<(u16, String)> {
             .name("episode")
             .and_then(|value| (!value.as_str().is_empty()).then_some(value.as_str()))
             .and_then(|value| value.parse::<u16>().ok());
-        let title = episode
-            .map(|num| format!("{}{}", label, num))
-            .unwrap_or_else(|| label.clone());
-        return Some((special_sort_number(&label, episode), title));
+        return Some(special_marker_result(&label, episode));
     }
 
     let suffix = SUFFIX_SPECIAL_RE.get_or_init(|| {
-        Regex::new(r"(?i)[ ._-]+-\s*(?P<label>cm|ed|op|pv|menu|tvcm)(?P<episode>\d{1,3})\s*$")
+        Regex::new(
+            r"(?i)[ ._-]+-\s*(?P<label>special|sp|bdcm|psvcm|tvcm|cm|ed|op|pv|menu)(?P<episode>\d{1,3})\s*$",
+        )
             .unwrap()
     });
     let caps = suffix.captures(stem)?;
     let label = caps.name("label")?.as_str().to_ascii_uppercase();
     let episode = caps.name("episode")?.as_str().parse::<u16>().ok()?;
+    Some(special_marker_result(&label, Some(episode)))
+}
+
+fn detect_season_remix_special(stem: &str) -> Option<(u16, String)> {
+    static SEASON_REMIX_RE: OnceLock<Regex> = OnceLock::new();
+    let re = SEASON_REMIX_RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[\] ._-])\[(?:s(?P<season>\d{1,2})[ ._-]*remix)\](?:$|\[|[ ._-])")
+            .unwrap()
+    });
+    let season = re
+        .captures(stem)?
+        .name("season")?
+        .as_str()
+        .parse::<u16>()
+        .ok()
+        .filter(|season| *season > 0)?;
     Some((
-        special_sort_number(&label, Some(episode)),
-        format!("{}{}", label, episode),
+        special_sort_number("Special", Some(80 + season)),
+        format!("S{} Remix", season),
     ))
+}
+
+fn special_marker_result(label: &str, episode: Option<u16>) -> (u16, String) {
+    let normalized = normalize_segment(label);
+    let title = match normalized.as_str() {
+        "sp" | "special" => episode
+            .map(|num| format!("Special {}", num))
+            .unwrap_or_else(|| "Special".to_string()),
+        "menu" => episode
+            .map(|num| format!("Menu {}", num))
+            .unwrap_or_else(|| "Menu".to_string()),
+        _ => episode
+            .map(|num| format!("{}{}", label, num))
+            .unwrap_or_else(|| label.to_string()),
+    };
+    (special_sort_number(label, episode), title)
 }
 
 fn detect_named_special(stem: &str) -> Option<(u16, String)> {
@@ -652,15 +745,21 @@ fn detect_special_file_number_and_title(stem: &str, context_label: &str) -> Opti
         return Some((episode_number, title));
     }
 
-    let episode_number = crate::scanner::bracket_episode_marker(stem)
+    let maybe_episode_number = crate::scanner::bracket_episode_marker(stem)
         .map(|(_, episode)| episode)
         .or_else(|| crate::scanner::loose_numbered_episode_suffix(stem).map(|(_, episode)| episode))
         .or_else(|| trailing_plain_number(stem))
-        .or_else(|| plain_numeric_episode_number(stem))?;
+        .or_else(|| plain_numeric_episode_number(stem));
+
+    let Some(episode_number) = maybe_episode_number else {
+        return contextual_special_title(stem)
+            .map(|title| (special_sort_number(context_label, None), title));
+    };
 
     let title = match context_label {
         "Special" => format!("Special {}", episode_number),
         "OVA" => format!("OVA {}", episode_number),
+        "CM" => format!("CM{}", episode_number),
         "PV" => format!("PV{}", episode_number),
         "Menu" => format!("Menu {}", episode_number),
         "CD" => format!("CD {}", episode_number),
@@ -696,7 +795,7 @@ fn detect_plain_labeled_special(stem: &str) -> Option<(u16, String)> {
     static PLAIN_LABELED_SPECIAL_RE: OnceLock<Regex> = OnceLock::new();
     let re = PLAIN_LABELED_SPECIAL_RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:^|[\] ._-])(?P<label>cm|ed|op|pv|menu|tvcm|ncop|nced|cd)[ ._-]*(?P<episode>\d{0,3})(?:$|\[|[ ._-])",
+            r"(?i)(?:^|[\] ._-])(?P<label>special|sp|bdcm|psvcm|tvcm|ncop|nced|cm|ed|op|pv|menu|cd)[ ._-]*(?P<episode>\d{0,3})(?:$|\[|[ ._-])",
         )
         .unwrap()
     });
@@ -707,6 +806,9 @@ fn detect_plain_labeled_special(stem: &str) -> Option<(u16, String)> {
         .and_then(|value| (!value.as_str().is_empty()).then_some(value.as_str()))
         .and_then(|value| value.parse::<u16>().ok());
     let title = match label.as_str() {
+        "SP" | "SPECIAL" => episode
+            .map(|num| format!("Special {}", num))
+            .unwrap_or_else(|| "Special".to_string()),
         "MENU" => episode
             .map(|num| format!("Menu {}", num))
             .unwrap_or_else(|| "Menu".to_string()),
@@ -720,11 +822,72 @@ fn detect_plain_labeled_special(stem: &str) -> Option<(u16, String)> {
     Some((special_sort_number(&label, episode), title))
 }
 
+fn contextual_special_title(stem: &str) -> Option<String> {
+    let sanitized_stem = crate::scanner::strip_release_bracket_suffixes(stem);
+    descriptive_bracket_title(&sanitized_stem).or_else(|| {
+        let (title, _) = crate::scanner::parse_filename(&sanitized_stem);
+        clean_contextual_special_title(&title)
+    })
+}
+
+fn descriptive_bracket_title(stem: &str) -> Option<String> {
+    let mut titles = Vec::new();
+    let mut remaining = stem;
+    while let Some(start) = remaining.find('[') {
+        let after_start = &remaining[start + 1..];
+        let Some(end) = after_start.find(']') else {
+            break;
+        };
+        let content = after_start[..end].trim();
+        if special_bracket_title_looks_descriptive(content) {
+            titles.push(content.to_string());
+        }
+        remaining = &after_start[end + 1..];
+    }
+
+    titles
+        .into_iter()
+        .last()
+        .and_then(|title| clean_contextual_special_title(&title))
+}
+
+fn special_bracket_title_looks_descriptive(content: &str) -> bool {
+    let normalized = normalize_segment(content);
+    !normalized.is_empty()
+        && !matches!(
+            normalized.as_str(),
+            "bdrip"
+                | "dvdrip"
+                | "webrip"
+                | "webdl"
+                | "hevc"
+                | "x264"
+                | "x265"
+                | "flac"
+                | "aac"
+                | "ma10p"
+                | "hi10p"
+                | "nekomoekissaten"
+        )
+        && content.chars().any(|ch| ch.is_alphabetic())
+        && content.split_whitespace().count() > 1
+}
+
+fn clean_contextual_special_title(title: &str) -> Option<String> {
+    let normalized = title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 fn special_sort_number(label: &str, episode: Option<u16>) -> u16 {
     let normalized = normalize_segment(label);
     let base = match normalized.as_str() {
         "cd" => 50,
-        "cm" => 100,
+        "cm" | "bdcm" | "psvcm" => 100,
         "tvcm" => 150,
         "pv" => 200,
         "menu" => 250,
@@ -732,7 +895,7 @@ fn special_sort_number(label: &str, episode: Option<u16>) -> u16 {
         "ed" | "nced" => 400,
         "tvreproduction" => 450,
         "sunnyday" => 500,
-        "special" => 600,
+        "sp" | "special" => 600,
         "ova" => 700,
         _ => 600,
     };
@@ -1040,8 +1203,21 @@ mod tests {
         assert_eq!(info.episode_number, 52);
         assert_eq!(info.title_override.as_deref(), Some("CD 2"));
 
-        let goblin_pv_movie = movie(
+        let goblin_nested_cd_movie = movie(
             18,
+            "TYBX 10144 Artist Visual Satsuei Making video",
+            "/vol2/1000/media/TV/Anime/Goblin Slayer/CDs/[181128] 銀の祈誓/ゴブリンスレイヤー盤 [TYCT-39097]/[Nekomoe kissaten] TYBX_10144 [Artist Visual Satsuei Making video][DVDRip 576p HEVC-10bit FLAC].mkv",
+        );
+        let info = detect_episode_info(&goblin_nested_cd_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 51);
+        assert_eq!(
+            info.title_override.as_deref(),
+            Some("Artist Visual Satsuei Making video")
+        );
+
+        let goblin_pv_movie = movie(
+            19,
             "Goblin Slayer",
             "/media/TV/Anime/Goblin Slayer/SPs/[Nekomoe kissaten] Goblin Slayer PV 01 [BDRip 1080p HEVC-10bit FLAC].mkv",
         );
@@ -1051,13 +1227,53 @@ mod tests {
         assert_eq!(info.title_override.as_deref(), Some("PV1"));
 
         let hunter_movie = movie(
-            19,
+            20,
             "Hunter X Hunter",
             "/media/TV/Anime/Hunter X Hunter/[Kamigami] Hunter X Hunter - 06 [x264 1280x720 AAC Sub(CH,JP)].mkv",
         );
         let info = detect_episode_info(&hunter_movie).unwrap();
         assert_eq!(info.season_number, 1);
         assert_eq!(info.episode_number, 6);
+
+        let fate_zero_sp_movie = movie(
+            21,
+            "Fate Zero",
+            "/media/TV/Anime/Fate Zero/SPs/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][SP01][x264_flac](86033D45).mkv",
+        );
+        let info = detect_episode_info(&fate_zero_sp_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 601);
+        assert_eq!(info.title_override.as_deref(), Some("Special 1"));
+
+        let fate_zero_remix_movie = movie(
+            22,
+            "Fate Zero",
+            "/media/TV/Anime/Fate Zero/SPs/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][S1Remix][x264_flac](6037A957).mkv",
+        );
+        let info = detect_episode_info(&fate_zero_remix_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 681);
+        assert_eq!(info.title_override.as_deref(), Some("S1 Remix"));
+
+        let fate_zero_bdcm_movie = movie(
+            23,
+            "Fate Zero",
+            "/media/TV/Anime/Fate Zero/CMs/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][BDCM1][x264_flac](E0BC28CE).mkv",
+        );
+        let info = detect_episode_info(&fate_zero_bdcm_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 101);
+        assert_eq!(info.title_override.as_deref(), Some("BDCM1"));
+
+        let fate_zero_psvcm_movie = movie(
+            24,
+            "Fate Zero",
+            "/media/TV/Anime/Fate Zero/CMs/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][PSVCM][x264_flac](51DC7E81).mkv",
+        );
+        let info = detect_episode_info(&fate_zero_psvcm_movie).unwrap();
+        assert_eq!(info.season_number, 0);
+        assert_eq!(info.episode_number, 101);
+        assert_eq!(info.title_override.as_deref(), Some("PSVCM"));
     }
 
     #[test]
@@ -1193,6 +1409,85 @@ mod tests {
         assert_eq!(root.items[0].kind, LibraryItemKind::Series);
         let seasons = tree.paged_items(Some(&root.items[0].id), None, 0, None);
         assert_eq!(seasons.items[0].season_number, Some(0));
+    }
+
+    #[test]
+    fn test_media_tree_groups_fate_zero_sp_and_cm_entries() {
+        let tree = MediaTree::from_movies(vec![
+            movie(
+                1,
+                "Fate Zero",
+                "/media/TV/Anime/Fate Zero/SPs/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][SP01][x264_flac](86033D45).mkv",
+            ),
+            movie(
+                2,
+                "Fate Zero",
+                "/media/TV/Anime/Fate Zero/SPs/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][SP02][x264_flac](43EE61A5).mkv",
+            ),
+            movie(
+                3,
+                "Fate Zero",
+                "/media/TV/Anime/Fate Zero/SPs/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][S1Remix][x264_flac](6037A957).mkv",
+            ),
+            movie(
+                4,
+                "Fate Zero",
+                "/media/TV/Anime/Fate Zero/CMs/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][BDCM1][x264_flac](E0BC28CE).mkv",
+            ),
+            movie(
+                5,
+                "Fate Zero",
+                "/media/TV/Anime/Fate Zero/CMs/[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][PSVCM][x264_flac](51DC7E81).mkv",
+            ),
+        ]);
+
+        let root = tree.paged_items(None, None, 0, None);
+        assert_eq!(root.total_record_count, 1);
+        assert_eq!(root.items[0].kind, LibraryItemKind::Series);
+        assert_eq!(root.items[0].title, "Fate Zero");
+
+        let seasons = tree.paged_items(Some(&root.items[0].id), None, 0, None);
+        assert_eq!(seasons.total_record_count, 1);
+        assert_eq!(seasons.items[0].season_number, Some(0));
+
+        let episodes = tree.paged_items(Some(&seasons.items[0].id), None, 0, None);
+        let titles = episodes
+            .items
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(episodes.total_record_count, 5);
+        assert!(titles.contains(&"BDCM1"));
+        assert!(titles.contains(&"PSVCM"));
+        assert!(titles.contains(&"Special 1"));
+        assert!(titles.contains(&"Special 2"));
+        assert!(titles.contains(&"S1 Remix"));
+    }
+
+    #[test]
+    fn test_media_tree_groups_nested_cd_extra_under_series_parent() {
+        let tree = MediaTree::from_movies(vec![movie(
+            1,
+            "TYBX 10144 Artist Visual Satsuei Making video",
+            "/vol2/1000/media/TV/Anime/Goblin Slayer/CDs/[181128] 銀の祈誓/ゴブリンスレイヤー盤 [TYCT-39097]/[Nekomoe kissaten] TYBX_10144 [Artist Visual Satsuei Making video][DVDRip 576p HEVC-10bit FLAC].mkv",
+        )]);
+
+        let root = tree.paged_items(None, None, 0, None);
+        assert_eq!(root.total_record_count, 1);
+        assert_eq!(root.items[0].kind, LibraryItemKind::Series);
+        assert_eq!(root.items[0].title, "Goblin Slayer");
+
+        let seasons = tree.paged_items(Some(&root.items[0].id), None, 0, None);
+        assert_eq!(seasons.total_record_count, 1);
+        assert_eq!(seasons.items[0].season_number, Some(0));
+
+        let episodes = tree.paged_items(Some(&seasons.items[0].id), None, 0, None);
+        assert_eq!(episodes.total_record_count, 1);
+        assert_eq!(
+            episodes.items[0].title,
+            "Artist Visual Satsuei Making video"
+        );
+        assert_eq!(episodes.items[0].play_id, Some(1));
     }
 
     #[test]

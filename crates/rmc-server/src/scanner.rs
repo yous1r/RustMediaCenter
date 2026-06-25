@@ -247,7 +247,8 @@ pub(crate) fn derive_title_year_from_path(path: &Path) -> (String, Option<u16>) 
     match parent_title {
         Some((parent_title, parent_year))
             if file_stem_needs_parent_title(file_stem)
-                || file_stem_has_special_title_marker(file_stem)
+                || (file_stem_has_special_title_marker(file_stem)
+                    && special_title_matches_parent(&title, &parent_title))
                 || should_prefer_parent_title(&title, year, &parent_title, parent_year) =>
         {
             (parent_title, parent_year.or(year))
@@ -283,6 +284,8 @@ fn directory_is_media_group(segment: &str) -> bool {
             | "ovas"
             | "oad"
             | "oads"
+            | "cm"
+            | "cms"
             | "pv"
             | "pvs"
             | "preview"
@@ -312,6 +315,8 @@ fn file_stem_has_special_title_marker(file_stem: &str) -> bool {
         "specials",
         "ova",
         "oad",
+        "cm",
+        "cms",
         "pv",
         "menu",
         "menus",
@@ -320,6 +325,16 @@ fn file_stem_has_special_title_marker(file_stem: &str) -> bool {
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
+}
+
+fn special_title_matches_parent(file_title: &str, parent_title: &str) -> bool {
+    let normalized_file_title = normalize_title_for_comparison(file_title);
+    let normalized_parent_title = normalize_title_for_comparison(parent_title);
+
+    !normalized_file_title.is_empty()
+        && !normalized_parent_title.is_empty()
+        && (normalized_file_title == normalized_parent_title
+            || normalized_file_title.starts_with(&format!("{} ", normalized_parent_title)))
 }
 
 fn should_prefer_parent_title(
@@ -394,10 +409,14 @@ pub(crate) fn strip_release_bracket_suffixes(stem: &str) -> String {
 
 fn strip_leading_release_groups(stem: &str) -> (&str, bool) {
     let has_bracketed_release_tag = contains_bracketed_release_tag(stem);
+    let has_leading_bracket_release_group = leading_bracket_group(stem)
+        .map(leading_bracket_group_looks_like_release_metadata)
+        .unwrap_or(false);
     if episode_marker_start(&split_title_tokens(stem)).is_none()
         && bracket_episode_marker(stem).is_none()
         && release_group_suffix_marker(stem, has_known_release_prefix(stem)).is_none()
         && !has_bracketed_release_tag
+        && !has_leading_bracket_release_group
         && strip_known_release_prefix(stem).is_none()
     {
         return (stem.trim(), false);
@@ -435,6 +454,12 @@ fn strip_leading_release_groups(stem: &str) -> (&str, bool) {
     (remaining, stripped_bracket_group)
 }
 
+fn leading_bracket_group(stem: &str) -> Option<&str> {
+    let rest = stem.trim().strip_prefix('[')?;
+    let closing_index = rest.find(']')?;
+    Some(&rest[..closing_index])
+}
+
 fn leading_bracket_group_looks_like_release_metadata(content: &str) -> bool {
     let trimmed = content.trim();
     !trimmed.is_empty()
@@ -450,7 +475,7 @@ pub(crate) fn bracket_episode_marker(stem: &str) -> Option<(usize, u16)> {
         regex::Regex::new(
             r"(?:^|[\] ._-])(?P<marker>\[(?P<episode>\d{1,3})(?:v\d+)?\])(?:$|\[|[ ._-])",
         )
-            .unwrap()
+        .unwrap()
     });
     let captures = re.captures(stem)?;
     let marker = captures.name("marker")?;
@@ -610,7 +635,8 @@ fn strip_trailing_year_token<'a>(title: &'a str, year: u16) -> Option<&'a str> {
     let year_string = year.to_string();
     let trimmed = title.trim_end();
     let suffix = trimmed.strip_suffix(&year_string)?;
-    let suffix = suffix.trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, '.' | '_' | '-'));
+    let suffix =
+        suffix.trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, '.' | '_' | '-'));
     (!suffix.is_empty()).then_some(suffix)
 }
 
@@ -807,23 +833,14 @@ mod tests {
                 "[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][12][x264_flac](131BE92D).mkv",
                 "Fate Zero",
             ),
-            (
-                "SumiSora&MAGI ATELIER&CASO Fate Zero.mkv",
-                "Fate Zero",
-            ),
+            ("SumiSora&MAGI ATELIER&CASO Fate Zero.mkv", "Fate Zero"),
             (
                 "Kamigami Fate stay night UBW - PV02.mkv",
                 "Fate stay night UBW",
             ),
             ("LoliHouse Clevatess - 06.mkv", "Clevatess"),
-            (
-                "DMG&MH&LoliHouse Goblin Slayer - 03.mkv",
-                "Goblin Slayer",
-            ),
-            (
-                "Kamigami Hunter X Hunter - 100.mkv",
-                "Hunter X Hunter",
-            ),
+            ("DMG&MH&LoliHouse Goblin Slayer - 03.mkv", "Goblin Slayer"),
+            ("Kamigami Hunter X Hunter - 100.mkv", "Hunter X Hunter"),
         ];
 
         for (filename, _) in &samples {
@@ -849,7 +866,11 @@ mod tests {
                 .iter()
                 .find(|movie| movie.file_path == file_path)
                 .unwrap_or_else(|| panic!("missing movie row for {}", filename));
-            assert_eq!(movie.title, *expected_title, "unexpected title for {}", filename);
+            assert_eq!(
+                movie.title, *expected_title,
+                "unexpected title for {}",
+                filename
+            );
         }
     }
 
@@ -931,7 +952,11 @@ mod tests {
                 .iter()
                 .find(|movie| movie.file_path == file_path)
                 .unwrap_or_else(|| panic!("missing movie row for {}", filename));
-            assert_eq!(movie.title, *expected_title, "unexpected title for {}", filename);
+            assert_eq!(
+                movie.title, *expected_title,
+                "unexpected title for {}",
+                filename
+            );
         }
     }
 
@@ -1040,7 +1065,9 @@ mod tests {
             ("Fate Zero".to_string(), None)
         );
         assert_eq!(
-            parse_filename("[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][12][x264_flac](131BE92D)"),
+            parse_filename(
+                "[SumiSora&MAGI_ATELIER&CASO][Fate_Zero][BDRip][12][x264_flac](131BE92D)"
+            ),
             ("Fate Zero".to_string(), None)
         );
         assert_eq!(
@@ -1099,6 +1126,28 @@ mod tests {
         );
         assert_eq!(
             derive_title_year_from_path(cd),
+            ("Goblin Slayer".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn test_derive_title_year_from_path_keeps_special_marker_filename_when_parent_unrelated() {
+        let pv = Path::new("/tmp/tmp9VfY7R/Kamigami Fate stay night UBW - PV02.mkv");
+
+        assert_eq!(
+            derive_title_year_from_path(pv),
+            ("Fate stay night UBW".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn test_derive_title_year_from_path_strips_bracketed_release_group_with_plain_episode_suffix() {
+        let path = Path::new(
+            "/media/TV/Anime/Goblin Slayer/[Nekomoe kissaten] Goblin Slayer 01 [BDRip 1080p HEVC-10bit FLACx2].mkv",
+        );
+
+        assert_eq!(
+            derive_title_year_from_path(path),
             ("Goblin Slayer".to_string(), None)
         );
     }

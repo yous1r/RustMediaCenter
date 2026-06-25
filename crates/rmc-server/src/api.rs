@@ -314,13 +314,16 @@ pub struct StreamTranscodeQuery {
 struct MetadataScrapeJob {
     title: String,
     year: Option<u16>,
+    search_hint: crate::scraper::MetadataSearchHint,
     movie_ids: Vec<i64>,
     stored_titles: Vec<String>,
 }
 
 const TMDB_TITLE_SIMILARITY_THRESHOLD: f64 = 0.85;
 
-fn metadata_scrape_identity(movie: &Movie) -> (String, Option<u16>) {
+fn metadata_scrape_identity(
+    movie: &Movie,
+) -> (String, Option<u16>, crate::scraper::MetadataSearchHint) {
     let (parsed_title, parsed_year) = crate::scanner::derive_title_year_from_path(&movie.file_path);
     let normalized_title = crate::scraper::normalize_query_title(&parsed_title);
     let fallback_title = crate::scraper::normalize_query_title(&movie.title);
@@ -331,18 +334,67 @@ fn metadata_scrape_identity(movie: &Movie) -> (String, Option<u16>) {
     } else {
         movie.title.clone()
     };
-    (title, parsed_year.or(movie.year))
+    (
+        title,
+        parsed_year.or(movie.year),
+        metadata_search_hint_from_path(&movie.file_path),
+    )
+}
+
+fn metadata_search_hint_from_path(path: &std::path::Path) -> crate::scraper::MetadataSearchHint {
+    let mut documentary = false;
+
+    for component in path
+        .parent()
+        .into_iter()
+        .flat_map(|parent| parent.components())
+    {
+        let std::path::Component::Normal(segment) = component else {
+            continue;
+        };
+        let normalized = normalize_metadata_path_segment(&segment.to_string_lossy());
+        if matches!(
+            normalized.as_str(),
+            "anime" | "animation" | "animations" | "donghua" | "cartoon" | "cartoons" | "动漫"
+        ) {
+            return crate::scraper::MetadataSearchHint::Anime;
+        }
+        if matches!(
+            normalized.as_str(),
+            "documentary" | "documentaries" | "docu" | "docs" | "纪录片"
+        ) {
+            documentary = true;
+        }
+    }
+
+    if documentary {
+        crate::scraper::MetadataSearchHint::Documentary
+    } else {
+        crate::scraper::MetadataSearchHint::Movie
+    }
+}
+
+fn normalize_metadata_path_segment(segment: &str) -> String {
+    segment
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
 }
 
 fn build_metadata_scrape_jobs(movies: Vec<Movie>) -> Vec<MetadataScrapeJob> {
-    let mut jobs_by_key: BTreeMap<(String, Option<u16>), MetadataScrapeJob> = BTreeMap::new();
+    let mut jobs_by_key: BTreeMap<
+        (String, Option<u16>, crate::scraper::MetadataSearchHint),
+        MetadataScrapeJob,
+    > = BTreeMap::new();
 
     for movie in movies {
-        let (title, year) = metadata_scrape_identity(&movie);
-        let key = (title.clone(), year);
+        let (title, year, search_hint) = metadata_scrape_identity(&movie);
+        let key = (title.clone(), year, search_hint);
         let entry = jobs_by_key.entry(key).or_insert_with(|| MetadataScrapeJob {
             title,
             year,
+            search_hint,
             movie_ids: Vec::new(),
             stored_titles: Vec::new(),
         });
@@ -381,6 +433,10 @@ fn metadata_scrape_jobs_are_similar(
     right: &MetadataScrapeJob,
     threshold: f64,
 ) -> bool {
+    if left.search_hint != right.search_hint {
+        return false;
+    }
+
     if let (Some(left_year), Some(right_year)) = (left.year, right.year) {
         if left_year != right_year {
             return false;
@@ -581,15 +637,34 @@ pub async fn direct_play(
         .unwrap_or("");
 
     if extension.eq_ignore_ascii_case("strm") {
+        let request_user_agent = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let content = tokio::fs::read_to_string(&file_path)
             .await
             .context("Failed to read strm file")?;
         if let Some(source) = crate::strm::StrmParser::parse(&content) {
             use axum::http::{header, StatusCode};
             use axum::response::{IntoResponse, Response};
+            let location = match source
+                .resolve_playable_url_with_user_agent(request_user_agent.as_deref())
+                .await
+            {
+                Ok(url) => url,
+                Err(err) => {
+                    tracing::warn!(
+                        source_url = %source.url,
+                        error = %err,
+                        "Failed to resolve strm redirect before direct play; using original URL"
+                    );
+                    source.url
+                }
+            };
             let response = Response::builder()
                 .status(StatusCode::FOUND)
-                .header(header::LOCATION, source.url)
+                .header(header::LOCATION, location)
                 .body(axum::body::Body::empty())
                 .context("Failed to build response")?;
             Ok(response.into_response())
@@ -811,7 +886,7 @@ pub async fn trigger_scan(
                     config.tmdb_proxy_url.clone(),
                     config.tmdb_api_base.clone(),
                 );
-                match db_clone.get_movies_without_metadata().await {
+                match db_clone.get_movies_requiring_metadata_scrape().await {
                     Ok(movies) => {
                         for job in build_metadata_scrape_jobs(movies) {
                             tracing::info!(
@@ -819,18 +894,27 @@ pub async fn trigger_scan(
                                 stored_titles = ?job.stored_titles,
                                 query_title = %job.title,
                                 query_year = ?job.year,
+                                search_hint = ?job.search_hint,
                                 "Scraping metadata for grouped movies"
                             );
-                            match scraper.fetch_movie_metadata(&job.title, job.year).await {
+                            match scraper
+                                .fetch_movie_metadata_with_hint(
+                                    &job.title,
+                                    job.year,
+                                    job.search_hint,
+                                )
+                                .await
+                            {
                                 Ok(metadata) => {
                                     for movie_id in job.movie_ids {
                                         if let Err(e) = db_clone
-                                            .update_movie_metadata(
+                                            .update_movie_metadata_with_search_hint(
                                                 movie_id,
                                                 metadata.poster_url.clone(),
                                                 metadata.overview.clone(),
                                                 metadata.tmdb_id,
                                                 metadata.runtime_minutes,
+                                                job.search_hint.as_str(),
                                             )
                                             .await
                                         {
@@ -849,6 +933,7 @@ pub async fn trigger_scan(
                                         stored_titles = ?job.stored_titles,
                                         query_title = %job.title,
                                         query_year = ?job.year,
+                                        search_hint = ?job.search_hint,
                                         "Failed to fetch TMDB metadata: {:?}",
                                         e
                                     );
@@ -1485,6 +1570,58 @@ mod tests {
         assert_eq!(jobs[0].title, "Fate Zero");
     }
 
+    #[test]
+    fn test_metadata_scrape_jobs_include_directory_category_hints() {
+        let movies = vec![
+            Movie {
+                id: 1,
+                title: "Yu Yu Hakusho".to_string(),
+                year: None,
+                file_path: "/media/Anime/Yu Yu Hakusho/Yu Yu Hakusho S01E01 Surprised to be Dead 720p BluRay FLAC 2.0 x264-Chotab.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 1,
+                file_size: None,
+            },
+            Movie {
+                id: 2,
+                title: "Blue Planet II".to_string(),
+                year: None,
+                file_path: "/media/Documentary/Blue.Planet.II.S01.2160p.UHD.BluRay.x265-SCOTLUHD/Blue.Planet.II.S01E01.2160p.UHD.BluRay.x265-SCOTLUHD.mkv".into(),
+                poster_url: None,
+                overview: None,
+                tmdb_id: None,
+                runtime_minutes: None,
+                runtime_seconds: None,
+                added_at: 2,
+                file_size: None,
+            },
+        ];
+
+        let jobs = build_metadata_scrape_jobs(movies);
+
+        assert_eq!(jobs.len(), 2);
+        let anime_job = jobs
+            .iter()
+            .find(|job| job.title == "Yu Yu Hakusho")
+            .unwrap();
+        assert_eq!(
+            anime_job.search_hint,
+            crate::scraper::MetadataSearchHint::Anime
+        );
+        let documentary_job = jobs
+            .iter()
+            .find(|job| job.title == "Blue Planet II")
+            .unwrap();
+        assert_eq!(
+            documentary_job.search_hint,
+            crate::scraper::MetadataSearchHint::Documentary
+        );
+    }
+
     #[tokio::test]
     async fn test_trigger_scan_scrapes_with_filename_cleaned_title_for_existing_dirty_rows() {
         use crate::config::ServerConfig;
@@ -2042,13 +2179,41 @@ mod tests {
         use rmc_core::models::Movie;
         use tower::ServiceExt;
 
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0; 4096];
+                let Ok(read_len) = socket.read(&mut buffer).await else {
+                    return;
+                };
+                let request = String::from_utf8_lossy(&buffer[..read_len]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default();
+                let response = if path.starts_with("/play/") {
+                    "HTTP/1.1 302 Found\r\nlocation: /cdn/stream.mkv\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-type: video/x-matroska\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let source_url = format!("http://{}/play/stream.mkv", addr);
+        let resolved_url = format!("http://{}/cdn/stream.mkv", addr);
+
         let db = Database::new("sqlite::memory:").await.unwrap();
         db.init_schema().await.unwrap();
 
         // 创建临时 .strm 文件
         let temp_dir = tempfile::tempdir().unwrap();
         let strm_file_path = temp_dir.path().join("movie.strm");
-        std::fs::write(&strm_file_path, "http://example.com/stream.mkv").unwrap();
+        std::fs::write(&strm_file_path, source_url).unwrap();
 
         db.insert_movie(&Movie {
             id: 1,
@@ -2085,7 +2250,7 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert_eq!(location, "http://example.com/stream.mkv");
+        assert_eq!(location, resolved_url);
     }
 
     #[tokio::test]

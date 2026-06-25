@@ -93,6 +93,7 @@ impl Database {
                 poster_url TEXT,
                 overview TEXT,
                 tmdb_id INTEGER,
+                metadata_search_hint TEXT,
                 runtime_minutes INTEGER,
                 runtime_seconds INTEGER,
                 added_at INTEGER NOT NULL,
@@ -124,6 +125,14 @@ impl Database {
             .any(|row| row.get::<String, _>("name") == "runtime_seconds");
         if !has_runtime_seconds {
             sqlx::query("ALTER TABLE movies ADD COLUMN runtime_seconds INTEGER")
+                .execute(&self.pool)
+                .await?;
+        }
+        let has_metadata_search_hint = columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "metadata_search_hint");
+        if !has_metadata_search_hint {
+            sqlx::query("ALTER TABLE movies ADD COLUMN metadata_search_hint TEXT")
                 .execute(&self.pool)
                 .await?;
         }
@@ -576,13 +585,54 @@ impl Database {
         tmdb_id: Option<i64>,
         runtime_minutes: Option<u16>,
     ) -> Result<(), sqlx::Error> {
+        self.update_movie_metadata_internal(
+            id,
+            poster_url,
+            overview,
+            tmdb_id,
+            runtime_minutes,
+            None,
+        )
+        .await
+    }
+
+    pub async fn update_movie_metadata_with_search_hint(
+        &self,
+        id: i64,
+        poster_url: Option<String>,
+        overview: Option<String>,
+        tmdb_id: Option<i64>,
+        runtime_minutes: Option<u16>,
+        metadata_search_hint: &str,
+    ) -> Result<(), sqlx::Error> {
+        self.update_movie_metadata_internal(
+            id,
+            poster_url,
+            overview,
+            tmdb_id,
+            runtime_minutes,
+            Some(metadata_search_hint),
+        )
+        .await
+    }
+
+    async fn update_movie_metadata_internal(
+        &self,
+        id: i64,
+        poster_url: Option<String>,
+        overview: Option<String>,
+        tmdb_id: Option<i64>,
+        runtime_minutes: Option<u16>,
+        metadata_search_hint: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE movies SET poster_url = ?, overview = ?, tmdb_id = ?, runtime_minutes = ? WHERE id = ?"
+            "UPDATE movies SET poster_url = ?, overview = ?, tmdb_id = ?, runtime_minutes = ?, metadata_search_hint = ? WHERE id = ?"
         )
         .bind(poster_url)
         .bind(overview)
         .bind(tmdb_id)
         .bind(runtime_minutes.map(|r| r as i32))
+        .bind(metadata_search_hint)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -610,6 +660,21 @@ impl Database {
         let rows = sqlx::query("SELECT id, title, year, file_path, poster_url, overview, tmdb_id, runtime_minutes, runtime_seconds, added_at, file_size FROM movies WHERE tmdb_id IS NULL")
             .fetch_all(&self.pool)
             .await?;
+
+        let movies = rows.iter().map(map_row_to_movie).collect();
+        Ok(movies)
+    }
+
+    pub async fn get_movies_requiring_metadata_scrape(&self) -> Result<Vec<Movie>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, title, year, file_path, poster_url, overview, tmdb_id, runtime_minutes, runtime_seconds, added_at, file_size
+             FROM movies
+             WHERE tmdb_id IS NULL
+                OR metadata_search_hint IS NULL
+                OR trim(metadata_search_hint) = ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
 
         let movies = rows.iter().map(map_row_to_movie).collect();
         Ok(movies)
@@ -858,6 +923,45 @@ mod tests {
         db.delete_movie(movie_id).await.unwrap();
         let count_after_delete = db.get_movie_count().await.unwrap();
         assert_eq!(count_after_delete, 0);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_scrape_queue_includes_existing_metadata_without_search_hint_once() {
+        let db = Database::new("sqlite::memory:").await.unwrap();
+        db.init_schema().await.unwrap();
+
+        db.insert_movie(&Movie {
+            id: 1,
+            title: "Yu Yu Hakusho".to_string(),
+            year: None,
+            file_path: "/media/Anime/Yu Yu Hakusho/Yu Yu Hakusho S01E01.mkv".into(),
+            poster_url: Some("http://image/live-action.jpg".to_string()),
+            overview: Some("Wrong old metadata".to_string()),
+            tmdb_id: Some(999),
+            runtime_minutes: None,
+            runtime_seconds: None,
+            added_at: 1,
+            file_size: None,
+        })
+        .await
+        .unwrap();
+
+        let pending = db.get_movies_requiring_metadata_scrape().await.unwrap();
+        assert_eq!(pending.len(), 1);
+
+        db.update_movie_metadata_with_search_hint(
+            1,
+            Some("http://image/anime.jpg".to_string()),
+            Some("Correct anime metadata".to_string()),
+            Some(200),
+            Some(112),
+            "anime",
+        )
+        .await
+        .unwrap();
+
+        let pending = db.get_movies_requiring_metadata_scrape().await.unwrap();
+        assert_eq!(pending.len(), 0);
     }
 
     #[tokio::test]

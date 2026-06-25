@@ -209,6 +209,23 @@ impl TranscodeStrategy {
     }
 
     fn append_input_args(args: &mut Vec<String>, input_path: &str, input_headers: Option<&str>) {
+        if input_path.starts_with("http://") || input_path.starts_with("https://") {
+            args.extend([
+                "-seekable".to_string(),
+                "0".to_string(),
+                "-icy".to_string(),
+                "0".to_string(),
+                "-multiple_requests".to_string(),
+                "1".to_string(),
+            ]);
+            if !headers_contain(input_headers, "user-agent") {
+                args.extend([
+                    "-user_agent".to_string(),
+                    crate::strm::DEFAULT_REMOTE_USER_AGENT.to_string(),
+                ]);
+            }
+        }
+
         if let Some(headers) = input_headers.filter(|value| !value.trim().is_empty()) {
             args.extend(["-headers".to_string(), headers.to_string()]);
         }
@@ -418,6 +435,14 @@ impl TranscodeStrategy {
 
         args
     }
+}
+
+fn headers_contain(headers: Option<&str>, header_name: &str) -> bool {
+    headers
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim()))
+        .any(|name| name.eq_ignore_ascii_case(header_name))
 }
 
 impl TranscodeRuntimeConfig {
@@ -1393,6 +1418,31 @@ fi
 
         assert!(seek_index < input_index);
         assert!(args.windows(2).any(|w| w == ["-ss", "125.500"]));
+    }
+
+    #[test]
+    fn test_http_stream_args_include_115_compatible_input_options_before_input() {
+        let args = TranscodeStrategy::Software.build_stream_args(
+            "http://localhost:8095/api/v1/115/play/movie.mkv",
+            "/dev/dri/renderD128",
+            DEFAULT_STREAM_FRAGMENT_SECS,
+            None,
+            Some(125.5),
+            TranscodeQuality::Source,
+        );
+
+        let input_index = args.iter().position(|arg| arg == "-i").expect("missing -i");
+        for option in ["-seekable", "-icy", "-multiple_requests", "-user_agent"] {
+            let option_index = args
+                .iter()
+                .position(|arg| arg == option)
+                .unwrap_or_else(|| panic!("missing {}", option));
+            assert!(option_index < input_index, "{} should be before -i", option);
+        }
+        assert!(args.windows(2).any(|w| w == ["-seekable", "0"]));
+        assert!(args.windows(2).any(|w| w == ["-icy", "0"]));
+        assert!(args.windows(2).any(|w| w == ["-multiple_requests", "1"]));
+        assert!(args.windows(2).any(|w| w == ["-user_agent", "curl/8.0.1"]));
     }
 
     #[test]

@@ -1,0 +1,22 @@
+[package]
+name = "rmc-app"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["desktop"]
+desktop = ["dioxus/desktop"]
+mobile = ["dioxus/mobile"]
+
+[dependencies]
+dioxus = { version = "0.7.0", default-features = false, features = ["lib", "launch", "router"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmc-core = { path = "../rmc-core" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+url = "2"
+urlencoding = "2"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+serde_json = "1.0"

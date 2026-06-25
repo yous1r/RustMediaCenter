@@ -1,3 +1,4 @@
+import { createSeekState } from './player_seek_state.js';
 
 // 常量定义，消除魔术数字
 const DEBOUNCE_DELAY_MS = 300;
@@ -994,6 +995,7 @@ async function renderPlayerPage(app, id, mode) {
   let playbackOffsetSeconds = 0;
   let knownDurationSeconds = 0;
   let pendingTranscodeJump = false;
+  const seekState = createSeekState();
 
   const setRuntimeNote = (message) => {
     runtimeNote.textContent = message;
@@ -1069,7 +1071,9 @@ async function renderPlayerPage(app, id, mode) {
   const syncControls = () => {
     const paused = video.paused || video.ended;
     const duration = getDisplayDuration();
-    const currentTime = getDisplayCurrentTime();
+    const actualCurrentTime = getDisplayCurrentTime();
+    seekState.settle(actualCurrentTime);
+    const currentTime = seekState.getDisplayTime(actualCurrentTime);
     const volumeValue = video.muted ? 0 : Math.round((video.volume || 0) * 100);
 
     playToggle.textContent = paused ? '播放' : '暂停';
@@ -1218,6 +1222,7 @@ async function renderPlayerPage(app, id, mode) {
     syncControls();
   };
   const onTimeUpdate = () => syncControls();
+  const onSeeked = () => syncControls();
   const onVolumeChange = () => syncControls();
   const onFullscreenChange = () => {
     updatePlayerViewportClasses(playerContainer, video);
@@ -1277,18 +1282,30 @@ async function renderPlayerPage(app, id, mode) {
   });
   progress.addEventListener('input', () => {
     const nextTime = clampSeekTarget(Number(progress.value) / 10);
+    seekState.update(nextTime);
+    progress.value = String(Math.floor(nextTime * 10));
     currentTimeEl.textContent = formatPlaybackTime(nextTime);
     setRangeProgress(progress);
   });
   progress.addEventListener('change', async () => {
-    const nextTime = clampSeekTarget(Number(progress.value) / 10);
+    const nextTime = seekState.commit(clampSeekTarget(Number(progress.value) / 10));
+    progress.value = String(Math.floor(nextTime * 10));
+    currentTimeEl.textContent = formatPlaybackTime(nextTime);
+    setRangeProgress(progress);
+
     if (isTranscodeMode) {
       await restartTranscodeAt(nextTime);
+      seekState.clear();
+      syncControls();
       return;
     }
 
     if (Number.isFinite(video.duration)) {
-      video.currentTime = Number(progress.value) / 10;
+      video.currentTime = nextTime;
+      syncControls();
+    } else {
+      seekState.clear();
+      syncControls();
     }
   });
   volume.addEventListener('input', () => {
@@ -1308,6 +1325,7 @@ async function renderPlayerPage(app, id, mode) {
   video.addEventListener('ended', onEnded);
   video.addEventListener('loadedmetadata', onLoadedMetadata);
   video.addEventListener('timeupdate', onTimeUpdate);
+  video.addEventListener('seeked', onSeeked);
   video.addEventListener('volumechange', onVolumeChange);
   video.addEventListener('error', onError);
   document.addEventListener('fullscreenchange', onFullscreenChange);
@@ -1348,6 +1366,7 @@ async function renderPlayerPage(app, id, mode) {
       video.removeEventListener('ended', onEnded);
       video.removeEventListener('loadedmetadata', onLoadedMetadata);
       video.removeEventListener('timeupdate', onTimeUpdate);
+      video.removeEventListener('seeked', onSeeked);
       video.removeEventListener('volumechange', onVolumeChange);
       video.removeEventListener('error', onError);
       playToggle.removeEventListener('click', togglePlayback);
