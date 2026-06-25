@@ -209,6 +209,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/v1/movies/:id/hls/master.m3u8", get(hls_playlist))
         .route("/api/v1/movies/:id/hls/*segment", get(hls_segment))
         .route("/api/v1/movies/:id/stream.mp4", get(stream_transcode))
+        .route("/api/v1/movies/:id/stream.ts", get(stream_transcode_ts))
         .route("/api/v1/config", get(get_config).post(update_config))
         .route("/api/v1/scan", post(trigger_scan))
         .nest_service("/", ServeDir::new("web-client"))
@@ -733,6 +734,7 @@ pub async fn stream_transcode(
     State(db): State<AppState>,
     Path(id): Path<i64>,
     Query(query): Query<StreamTranscodeQuery>,
+    req: axum::http::Request<axum::body::Body>,
 ) -> Result<impl axum::response::IntoResponse, crate::error::AppError> {
     let movie = db
         .get_available_movie_by_id(id)
@@ -757,6 +759,7 @@ pub async fn stream_transcode(
             input_headers.as_deref(),
             start_time_secs,
             quality,
+            "mp4",
         )
         .await
         .map_err(|e| anyhow::anyhow!(e))
@@ -784,8 +787,76 @@ pub async fn stream_transcode(
     });
 
     let stream = ReaderStream::new(stdout);
-    let response = Response::builder()
+    
+    let is_range_request = req.headers().contains_key(header::RANGE);
+    let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "no-store");
+        
+    if is_range_request {
+        builder = builder
+            .status(axum::http::StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_RANGE, "bytes 0-/*");
+    }
+
+    let response = builder
+        .body(Body::from_stream(stream))
+        .context("Failed to build streaming transcode response")?;
+    Ok(response)
+}
+
+pub async fn stream_transcode_ts(
+    State(db): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<StreamTranscodeQuery>,
+) -> Result<impl axum::response::IntoResponse, crate::error::AppError> {
+    let movie = db
+        .get_available_movie_by_id(id)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => {
+                crate::error::AppError::NotFound(format!("Movie id {} not found", id))
+            }
+            _ => crate::error::AppError::Internal(e.into()),
+        })?;
+
+    let (input_path, input_headers) = resolve_movie_input(&movie.file_path).await?;
+    let start_time_secs = query
+        .start_time
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    let quality = TranscodeQuality::from_label(query.quality.as_deref());
+    let transcode = get_transcode_manager();
+    let session = transcode
+        .start_stream_transcode(
+            id,
+            &input_path,
+            input_headers.as_deref(),
+            start_time_secs,
+            quality,
+            "mpegts",
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("Failed to start streaming transcode")?;
+
+    let crate::transcode::StreamTranscodeSession {
+        mut child,
+        stdout,
+        cleanup_dir,
+    } = session;
+
+    tokio::spawn(async move {
+        let wait_result = child.wait().await;
+        if let Err(err) = tokio::fs::remove_dir_all(&cleanup_dir).await {
+            tracing::warn!(movie_id = id, error = %err, "Failed to clean up streaming transcode directory");
+        }
+        let _ = wait_result;
+    });
+
+    let stream = ReaderStream::new(stdout);
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, "video/mp2t")
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .context("Failed to build streaming transcode response")?;
@@ -820,8 +891,14 @@ pub async fn hls_segment(
         .await
         .context("Failed to read segment")?;
 
+    let content_type = if segment_clean.ends_with(".m4s") || segment_clean.ends_with(".mp4") {
+        "video/mp4"
+    } else {
+        "video/MP2T"
+    };
+
     let response = axum::response::Response::builder()
-        .header("Content-Type", "video/MP2T")
+        .header("Content-Type", content_type)
         .body(axum::body::Body::from(content))
         .context("Failed to build response")?;
     Ok(response)

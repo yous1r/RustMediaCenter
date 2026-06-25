@@ -109,6 +109,22 @@ function buildTranscodeStreamPath(movieId, startTimeSeconds = 0, quality = 'sour
     params.set('quality', quality);
   }
 
+  const isIOSDevice = [
+    'iPad Simulator',
+    'iPhone Simulator',
+    'iPod Simulator',
+    'iPad',
+    'iPhone',
+    'iPod'
+  ].includes(navigator.platform)
+  || (navigator.userAgent.includes("Mac") && "ontouchend" in document)
+  || /iPad|iPhone|iPod/.test(navigator.userAgent)
+  || (/Safari/.test(navigator.userAgent) && !/Chrome/.test(navigator.userAgent));
+
+  if (isIOSDevice) {
+    return `/api/v1/movies/${movieId}/hls/master.m3u8`;
+  }
+
   const query = params.toString();
   return query
     ? `/api/v1/movies/${movieId}/stream.mp4?${query}`
@@ -504,16 +520,27 @@ function renderEpisodeList(episodes) {
       ? `Episode ${episode.episode_number}`
       : 'Episode';
 
-    return `
+    let html = '';
+    if (href === '#') {
+      html += `
+      <div class="library-episode-row" style="opacity: 0.6; cursor: not-allowed;" onclick="event.preventDefault(); alert('This episode is not available for playback.');">
+        <div class="library-episode-index">${escapeHtml(indexLabel)}</div>
+        <div class="library-episode-main">
+          <h3>${escapeHtml(episode.title)}</h3>`;
+    } else {
+      html += `
       <a href="${href}" class="library-episode-row" style="text-decoration: none;">
         <div class="library-episode-index">${escapeHtml(indexLabel)}</div>
         <div class="library-episode-main">
-          <h3>${escapeHtml(episode.title)}</h3>
+          <h3>${escapeHtml(episode.title)}</h3>`;
+    }
+    html += `
           <p>${escapeHtml(episode.overview || 'Open this episode in the player.')}</p>
         </div>
         <div class="library-episode-meta">${escapeHtml(formatLibraryItemMeta(episode))}</div>
-      </a>
+      ${href === '#' ? '</div>' : '</a>'}
     `;
+    return html.trim();
   }).join('');
 }
 

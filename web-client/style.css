@@ -22,6 +22,7 @@ body {
     radial-gradient(circle at 85% 30%, rgba(168, 85, 247, 0.12), transparent 25%);
   color: var(--text-primary);
   min-height: 100vh;
+  min-height: 100dvh;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -116,15 +117,17 @@ h1 {
   transition: opacity 0.3s ease;
 }
 
-.movie-card:hover {
-  transform: translateY(-8px) scale(1.03);
-  background: rgba(255, 255, 255, 0.06);
-  border-color: rgba(255, 255, 255, 0.2);
-  box-shadow: var(--shadow-lg), 0 0 25px rgba(99, 102, 241, 0.15);
-}
+@media (hover: hover) {
+  .movie-card:hover {
+    transform: translateY(-8px) scale(1.03);
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.2);
+    box-shadow: var(--shadow-lg), 0 0 25px rgba(99, 102, 241, 0.15);
+  }
 
-.movie-card:hover::before {
-  opacity: 0.5;
+  .movie-card:hover::before {
+    opacity: 0.5;
+  }
 }
 
 .movie-poster {
@@ -449,10 +452,12 @@ h1 {
   transition: transform 0.25s ease, background 0.25s ease, border-color 0.25s ease;
 }
 
-.library-episode-row:hover {
-  transform: translateY(-1px);
-  background: rgba(255,255,255,0.07);
-  border-color: rgba(255,255,255,0.14);
+@media (hover: hover) {
+  .library-episode-row:hover {
+    transform: translateY(-1px);
+    background: rgba(255,255,255,0.07);
+    border-color: rgba(255,255,255,0.14);
+  }
 }
 
 .library-episode-index {
@@ -526,6 +531,7 @@ h1 {
   left: 0;
   width: 100vw;
   height: 100vh;
+  height: 100dvh;
   background:
     radial-gradient(circle at top, rgba(229, 197, 134, 0.16), transparent 30%),
     linear-gradient(180deg, #070809 0%, #020304 100%);
@@ -681,10 +687,12 @@ h1 {
   left: var(--player-bottom-gap);
   right: var(--player-bottom-gap);
   bottom: var(--player-bottom-gap);
+  z-index: 1002;
   display: flex;
   flex-direction: column;
   gap: var(--player-control-gap);
   padding: 1rem 1.1rem;
+  padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
   background: linear-gradient(180deg, rgba(5, 7, 9, 0.18) 0%, rgba(5, 7, 9, 0.82) 100%);
   border: 1px solid rgba(255,255,255,0.08);
   border-radius: 20px;

@@ -153,14 +153,14 @@ impl TranscodeQuality {
     fn qsv_filter(self) -> String {
         match self.scale_filter() {
             Some(scale) => format!("{scale},format=nv12,hwupload=extra_hw_frames=64"),
-            None => "format=nv12,hwupload=extra_hw_frames=64".to_string(),
+            None => "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=nv12,hwupload=extra_hw_frames=64".to_string(),
         }
     }
 
     fn vaapi_filter(self) -> String {
         match self.scale_filter() {
             Some(scale) => format!("{scale},format=nv12,hwupload"),
-            None => "format=nv12,hwupload".to_string(),
+            None => "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=nv12,hwupload".to_string(),
         }
     }
 }
@@ -331,8 +331,10 @@ impl TranscodeStrategy {
             "0".to_string(),
             "-hls_flags".to_string(),
             "independent_segments".to_string(),
+            "-hls_segment_type".to_string(),
+            "fmp4".to_string(),
             "-hls_segment_filename".to_string(),
-            format!("{}/seq-%d.ts", output_dir),
+            format!("{}/seq-%d.m4s", output_dir),
             m3u8_path.to_string(),
         ]);
 
@@ -347,6 +349,7 @@ impl TranscodeStrategy {
         input_headers: Option<&str>,
         start_time_secs: Option<f64>,
         quality: TranscodeQuality,
+        container: &str,
     ) -> Vec<String> {
         let mut args = Vec::new();
 
@@ -417,21 +420,33 @@ impl TranscodeStrategy {
             }
         }
 
-        args.extend([
-            "-force_key_frames".to_string(),
-            format!("expr:gte(t,n_forced*{})", fragment_secs),
-            "-c:a".to_string(),
-            "aac".to_string(),
-            "-b:a".to_string(),
-            "128k".to_string(),
-            "-movflags".to_string(),
-            "frag_keyframe+empty_moov+default_base_moof".to_string(),
-            "-frag_duration".to_string(),
-            (fragment_secs * 1_000_000).to_string(),
-            "-f".to_string(),
-            "mp4".to_string(),
-            "pipe:1".to_string(),
-        ]);
+        if container == "mp4" {
+            args.extend([
+                "-force_key_frames".to_string(),
+                format!("expr:gte(t,n_forced*{})", fragment_secs),
+                "-c:a".to_string(),
+                "aac".to_string(),
+                "-b:a".to_string(),
+                "128k".to_string(),
+                "-movflags".to_string(),
+                "frag_keyframe+empty_moov+default_base_moof".to_string(),
+                "-frag_duration".to_string(),
+                (fragment_secs * 1_000_000).to_string(),
+                "-f".to_string(),
+                "mp4".to_string(),
+                "pipe:1".to_string(),
+            ]);
+        } else {
+            args.extend([
+                "-c:a".to_string(),
+                "aac".to_string(),
+                "-b:a".to_string(),
+                "128k".to_string(),
+                "-f".to_string(),
+                container.to_string(),
+                "pipe:1".to_string(),
+            ]);
+        }
 
         args
     }
@@ -949,6 +964,8 @@ impl TranscodeManager {
         input_headers: Option<&str>,
         start_time_secs: Option<f64>,
         quality: TranscodeQuality,
+        container: &str,
+
     ) -> Result<StreamTranscodeSession, Box<dyn std::error::Error + Send + Sync>> {
         if !Path::new(input_path).exists() && !input_path.starts_with("http") {
             return Err(Box::new(std::io::Error::new(
@@ -1003,6 +1020,7 @@ impl TranscodeManager {
                 input_headers,
                 start_time_secs,
                 quality,
+                container,
             );
             append_log_line(
                 &log_path,
